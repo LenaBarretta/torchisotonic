@@ -71,7 +71,9 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
 
 [tool.mypy]
 strict = true
-files = ["src", "tests"]
+files = ["src", "tests", "docs"]
+# tests/test_hull_prototype.py imports docs/hull_prototype.py by putting docs/ on sys.path.
+mypy_path = "docs"
 
 [[tool.mypy.overrides]]
 module = ["scipy", "scipy.*", "sklearn", "sklearn.*"]
