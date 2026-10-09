@@ -28,7 +28,7 @@ at::Tensor isotonic_cpu(const at::Tensor& y, const at::Tensor& w) {
       std::vector<int64_t> start(n);
       std::vector<scalar_t> weight(n), total(n);
       for (int64_t b = begin; b < end; ++b) {
-        pava<scalar_t, scalar_t>(
+        pava<scalar_t, scalar_t, int64_t>(
             yp + b * n, wp + b * n, op + b * n, n, 1, start.data(), weight.data(), total.data());
       }
     });

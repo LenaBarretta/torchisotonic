@@ -22,14 +22,14 @@ namespace torchisotonic {
 // y, w: the problem; out: the solution (may alias y). The three scratch arrays hold the
 // stack of blocks found so far, with `stride` like the data: their start index, total
 // weight and weighted sum. A NaN anywhere in y makes the whole solution NaN.
-template <typename scalar_t, typename acc_t>
+template <typename scalar_t, typename acc_t, typename index_t>
 TI_HD void pava(
     const scalar_t* y,
     const scalar_t* w,
     scalar_t* out,
     int64_t n,
     int64_t stride,
-    int64_t* start,
+    index_t* start,
     acc_t* weight,
     acc_t* total) {
   int64_t top = -1;  // index of the last block on the stack
@@ -43,7 +43,7 @@ TI_HD void pava(
     }
     acc_t wi = static_cast<acc_t>(w[i * stride]);
     ++top;
-    start[top * stride] = i;
+    start[top * stride] = static_cast<index_t>(i);
     weight[top * stride] = wi;
     total[top * stride] = wi * yi;
     // Merge while the previous block's mean is not below this one's. Comparing
