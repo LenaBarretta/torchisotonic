@@ -13,7 +13,7 @@ from torch.profiler import ProfilerActivity, profile
 
 import torchisotonic
 
-KERNELS = ("chunk", "merge", "ends", "fit", "isotonic")
+KERNELS = ("chunk", "packed", "merge", "ends", "fit", "isotonic")
 REPEATS = 5
 SHAPES = [(1, 100_000_000), (1, 1_000_000), (100, 100_000), (10_000, 1_000)]
 

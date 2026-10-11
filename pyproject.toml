@@ -52,7 +52,7 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.hatch.build.targets.sdist]
-exclude = ["bench", "notebooks", "docs", "kaggle", ".github"]
+exclude = ["bench", "notebooks", "docs", "kaggle", "experiments", ".github"]
 
 [tool.hatch.version]
 path = "src/torchisotonic/__init__.py"

@@ -1,1 +1,92 @@
 # torchisotonic
+
+Batched isotonic regression for PyTorch tensors, fast on the GPU.
+
+Isotonic regression finds the non-decreasing (or non-increasing) sequence closest to the
+data in weighted least squares. It is what `sklearn.isotonic.isotonic_regression` and
+`scipy.optimize.isotonic_regression` compute for one sequence; torchisotonic computes it for
+every row of a tensor at once, on the CPU or with CUDA kernels on the GPU, from a few
+elements per row to a hundred million.
+
+```python
+import torch
+import torchisotonic
+
+y = torch.randn(1000, 5000, device="cuda")
+fit = torchisotonic.isotonic(y)  # every row, non-decreasing
+
+w = torch.rand(1000, 5000, device="cuda") + 0.1
+fit = torchisotonic.isotonic(y, w, increasing=False, y_min=0.0, y_max=1.0)
+```
+
+The semantics are scikit-learn's: weights must be strictly positive (a weight of the shape of
+`y`, or one that broadcasts to it), the result is clipped to `[y_min, y_max]` if they are
+given, `dim` picks the axis, and a row holding a NaN comes back as NaN. Float input keeps its
+dtype (float16 and bfloat16 are computed in float32), integer input becomes the default
+float dtype.
+
+**Status: pre-alpha.** Not on PyPI yet; the API may change. The C++/CUDA code is compiled the
+first time it is used (about a minute), which needs `ninja`, a C++ compiler and, for the GPU,
+the CUDA toolkit:
+
+```bash
+pip install git+https://github.com/LenaBarretta/torchisotonic
+```
+
+## Performance
+
+On an NVIDIA T4 (Kaggle), float32, unweighted, decreasing fits of data noisy around a trend,
+in milliseconds; best of ten calls on a warmed-up GPU, data already on the device for the GPU
+columns:
+
+| batch × n | torchisotonic (cuda) | torchsort (cuda) | torchisotonic (cpu) | torchsort (cpu) | scipy, a loop over rows |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1,000,000 × 16 | **1.05** | — | 387 | 650 | 13,309 |
+| 100,000 × 128 | **1.22** | — | 282 | 488 | 1,479 |
+| 10,000 × 1,000 | **0.80** | 101 | 154 | 338 | 300 |
+| 1,000 × 10,000 | **1.07** | 197 | 153 | 347 | 168 |
+| 100 × 100,000 | **1.18** | 396 | 152 | 344 | 161 |
+| 10 × 1,000,000 | **1.31** | 1,658 | 153 | 349 | 165 |
+| 1 × 10,000,000 | **1.35** | 5,493 | 247 | 341 | 184 |
+| 100 × 1,000 | **0.06** | 3.0 | 1.6 | 3.2 | 2.5 |
+| 10 × 10,000 | **0.19** | 14.0 | 1.5 | 3.2 | 1.6 |
+| 1 × 100,000 | **0.24** | 51.7 | 1.6 | 3.3 | 1.5 |
+| 1 × 1,000,000 | **0.40** | 550 | 16.6 | 32.9 | 14.7 |
+| 1 × 100,000,000 | **9.98** | — | 3,386 | — | — |
+
+torchsort (cuda) was not run with more than 10⁷ elements (a single call would take minutes);
+the CPU columns are on Kaggle's CPU, so they say how the libraries compare, not how fast a
+good CPU is. Reading the input and writing the fit at the T4's 320 GB/s takes 0.25 ms for 10⁷
+float32 elements and 2.5 ms for 10⁸: the GPU code is a few times above that, bound by the
+instructions the hull takes rather than by memory. `bench/bench.py` reproduces the table.
+
+## How it works
+
+The fit at each element is the slope of the lower convex hull of the cumulative sums of the
+data (the "greatest convex minorant"), so the GPU code builds that hull in parallel:
+
+1. Every lane of a warp builds the hull of 32 neighbouring points with the monotone chain,
+   its stack kept as a bit mask; then the lane hulls of a chunk of 1024 to 4096 elements merge
+   pairwise in shared memory, each merge walking to its bridge and clearing the bits under it.
+   Short rows are packed several per warp. A row that fits in one chunk is finished there.
+2. Longer rows merge their chunks' hulls pairwise, in rounds, as lists of segments of the
+   chunks' hulls, so that a merge costs segments rather than vertices.
+3. Every element takes the slope of the hull edge above it.
+
+[`docs/hull_prototype.py`](docs/hull_prototype.py) is a plain-numpy reference of the parallel
+algorithm; [`src/torchisotonic/csrc/ops_tiles.cu`](src/torchisotonic/csrc/ops_tiles.cu)
+describes the kernels. On the CPU, rows are solved with PAVA, in parallel.
+
+## Development
+
+```bash
+uv sync
+uv run pytest
+```
+
+The tests compare against scipy and scikit-learn (with hypothesis) and, on a machine with a
+GPU, the CUDA operator against the CPU one.
+
+## License
+
+MIT
