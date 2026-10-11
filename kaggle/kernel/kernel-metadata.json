@@ -1,5 +1,5 @@
 {
-  "id": "ilyabutuzov/torchisotonic-gpu",
+  "id": "lenabarretta/torchisotonic-gpu",
   "title": "torchisotonic-gpu",
   "code_file": "run.py",
   "language": "python",
@@ -8,7 +8,7 @@
   "enable_gpu": true,
   "enable_internet": true,
   "machine_shape": "NvidiaTeslaT4",
-  "dataset_sources": ["ilyabutuzov/torchisotonic"],
+  "dataset_sources": ["lenabarretta/torchisotonic"],
   "competition_sources": [],
   "kernel_sources": []
 }

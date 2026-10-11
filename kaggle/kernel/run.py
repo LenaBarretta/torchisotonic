@@ -18,9 +18,17 @@ OUT = "/kaggle/working"
 START = time.perf_counter()
 
 
+STEP_TIMEOUT = 1500  # seconds: a hung step (say, a kernel that never ends) is killed
+
+
 def sh(cmd: str) -> int:
     print(f"\n[{time.perf_counter() - START:6.0f}s] $ {cmd}", flush=True)
-    return subprocess.run(cmd, shell=True).returncode
+    try:
+        return subprocess.run(cmd, shell=True, timeout=STEP_TIMEOUT).returncode
+    except subprocess.TimeoutExpired:
+        print(f"TIMEOUT after {STEP_TIMEOUT} s", flush=True)
+        subprocess.run("pkill -9 -f 'python bench/|python -m pytest'", shell=True)
+        return 1
 
 
 # Kaggle mounts datasets under /kaggle/input (lately /kaggle/input/datasets/<owner>/<name>)
@@ -55,9 +63,29 @@ failed = sh(f'python -c "{smoke}"')
 if not failed and "tests" in STEPS:
     failed = sh(f"cd {SRC} && python -m pytest -q -p no:cacheprovider --no-cov -x tests")
 if not failed and "torchsort" in STEPS:
-    sh("pip install -q torchsort")
+    # Without build isolation, so that it compiles against the torch that is installed.
+    sh("pip install -q --no-build-isolation torchsort")
+if not failed and "profile" in STEPS:
+    # The SM clock, power and temperature while it runs: a T4 at its power limit slows down.
+    with open("/tmp/clocks.csv", "w") as log:
+        query = "clocks.sm,power.draw,temperature.gpu,clocks_throttle_reasons.active"
+        clocks = subprocess.Popen(  # no shell, so that kill() reaches nvidia-smi itself
+            ["nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader", "-lms", "50"],
+            stdout=log,
+        )
+        try:
+            sh(f"cd {SRC} && python bench/profile_hull.py")
+        finally:
+            clocks.kill()
+            clocks.wait()
+    sh("sort /tmp/clocks.csv | uniq -c | sort -rn | head -12")
+if not failed and "phases" in STEPS:
+    sh(f"cd {SRC} && python bench/phases.py")
 if not failed and ("bench" in STEPS or "bench-quick" in STEPS):
     quick = "--quick" if "bench-quick" in STEPS else ""
     failed = sh(f"cd {SRC} && python bench/bench.py {quick}")
     sh(f"cp -r {SRC}/bench/results {OUT}/results")
 print(f"\n[{time.perf_counter() - START:6.0f}s] DONE, failed={failed}", flush=True)
+# Nothing left behind may keep the Kaggle session alive.
+subprocess.run("pkill -9 -f nvidia-smi", shell=True)
+os._exit(0)

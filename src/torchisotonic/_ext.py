@@ -19,12 +19,28 @@ def isotonic(y: Tensor, w: Tensor) -> Tensor:
     return out
 
 
+def isotonic_hull(y: Tensor, w: Tensor, centre: Tensor, chunk: int) -> Tensor:
+    """The increasing fit of every row of ``y`` ([batch, n]) by hulls, in float64.
+
+    ``centre`` ([batch], float64) is subtracted from y before the cumulative sums and added
+    back to the fit.
+    """
+    out: Tensor = _load().isotonic_hull(y, w, centre, chunk)
+    return out
+
+
+def isotonic_tiles(y: Tensor, w: Tensor | None, increasing: bool) -> Tensor:  # pragma: no cover
+    """The fit of every row of ``y`` ([batch, n], CUDA) by the tile pipeline, in y's dtype."""
+    out: Tensor = _load().isotonic_tiles(y, w, increasing)
+    return out
+
+
 @functools.cache
 def _load() -> Any:
     """``torch.ops.torchisotonic``, compiled for this machine (and its GPU, if any) once."""
     sources = [CSRC / "ops.cpp"]
     if torch.cuda.is_available() and cpp_extension.CUDA_HOME is not None:  # pragma: no cover
-        sources.append(CSRC / "ops_cuda.cu")
+        sources += [CSRC / "ops_cuda.cu", CSRC / "ops_tiles.cu"]
     cpp_extension.load(
         name="torchisotonic_ops",
         sources=[str(s) for s in sources],

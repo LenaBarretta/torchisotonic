@@ -5,12 +5,12 @@
 #   kaggle/push.sh tests bench-quick  # ... + a small benchmark
 #   kaggle/push.sh tests torchsort bench
 #
-# Then: kaggle kernels status ilyabutuzov/torchisotonic-gpu
-#       kaggle kernels output ilyabutuzov/torchisotonic-gpu -p <dir>
+# Then: kaggle kernels status lenabarretta/torchisotonic-gpu
+#       kaggle kernels output lenabarretta/torchisotonic-gpu -p <dir>
 set -euo pipefail
 cd "$(dirname "$0")/.."
-DATASET=ilyabutuzov/torchisotonic
-KERNEL=ilyabutuzov/torchisotonic-gpu
+DATASET=lenabarretta/torchisotonic
+KERNEL=lenabarretta/torchisotonic-gpu
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 

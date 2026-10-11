@@ -26,8 +26,16 @@ import torch
 import torchisotonic
 
 FULL = [(1_000_000, 16), (100_000, 128), (10_000, 1_000), (1_000, 10_000), (100, 100_000),
-        (10, 1_000_000), (1, 10_000_000)]  # fmt: skip
-QUICK = [(10_000, 16), (100, 1_000), (1, 100_000)]
+        (10, 1_000_000), (1, 10_000_000), (100, 1_000), (10, 10_000), (1, 100_000),
+        (1, 1_000_000), (1, 100_000_000)]  # fmt: skip
+QUICK = [
+    (1_000_000, 16),
+    (100_000, 128),
+    (100, 1_000),
+    (1, 100_000),
+    (1_000, 10_000),
+    (1, 10_000_000),
+]
 RESULTS = Path(__file__).parent / "results"
 Fn = Callable[[], object]
 
@@ -35,13 +43,18 @@ Fn = Callable[[], object]
 def best_time(fn: Fn, sync: Callable[[], None], repeats: int) -> float:
     fn()  # warm-up; also compiles the operators
     sync()
+    if torch.cuda.is_available():
+        # An idle GPU runs at a low clock and takes a while to raise it: keep it busy first,
+        # or short GPU calls are timed at a fraction of the speed they run at under load.
+        torch.cuda._sleep(1_000_000_000)
+        sync()
     times = []
     for _ in range(repeats):
         start = time.perf_counter()
         fn()
         sync()
         times.append(time.perf_counter() - start)
-        if times[-1] > 5:  # slow enough that one run says it
+        if sum(times) > 10:  # slow enough that these runs say it
             break
     return min(times)
 
@@ -58,7 +71,7 @@ def impls(data: np.ndarray, cuda: bool) -> dict[str, Fn]:
     except ImportError:
         pass
     else:
-        if cuda:
+        if cuda and data.size <= 10_000_000:  # beyond, a single call takes minutes
             out["torchsort (cuda)"] = lambda: ts.isotonic_l2["cuda"](x)
         out["torchsort (cpu)"] = lambda: ts.isotonic_l2["cpu"](cpu)
     from scipy.optimize import isotonic_regression
@@ -70,7 +83,9 @@ def impls(data: np.ndarray, cuda: bool) -> dict[str, Fn]:
     return out
 
 
-def run(grid: list[tuple[int, int]], repeats: int) -> list[dict[str, Any]]:
+def run(
+    grid: list[tuple[int, int]], repeats: int, save: Callable[[list[dict[str, Any]]], None]
+) -> list[dict[str, Any]]:
     cuda = torch.cuda.is_available()
     sync = torch.cuda.synchronize if cuda else (lambda: None)
     rows = []
@@ -90,6 +105,7 @@ def run(grid: list[tuple[int, int]], repeats: int) -> list[dict[str, Any]]:
                 torch.cuda.empty_cache()
             rows.append(row)
             print(row, flush=True)
+            save(rows)  # as it goes: a run cut short keeps what it measured
     return rows
 
 
@@ -115,13 +131,12 @@ def markdown(rows: list[dict[str, Any]], device: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--quick", action="store_true", help="small grid")
-    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--repeats", type=int, default=10)
     args = parser.parse_args()
     if torch.cuda.is_available():
         device = torch.cuda.get_device_name(0)
     else:
         device = f"CPU ({platform.processor() or platform.machine()})"
-    rows = run(QUICK if args.quick else FULL, args.repeats)
     RESULTS.mkdir(exist_ok=True)
     slug = re.sub(r"[^a-z0-9]+", "-", device.lower()).strip("-")
     meta = {
@@ -129,8 +144,12 @@ def main() -> None:
         "torch": torch.__version__,
         "torchisotonic": torchisotonic.__version__,
     }
-    (RESULTS / f"{slug}.json").write_text(json.dumps({**meta, "rows": rows}, indent=1))
-    (RESULTS / f"{slug}.md").write_text(markdown(rows, device))
+
+    def save(rows: list[dict[str, Any]]) -> None:
+        (RESULTS / f"{slug}.json").write_text(json.dumps({**meta, "rows": rows}, indent=1))
+        (RESULTS / f"{slug}.md").write_text(markdown(rows, device))
+
+    run(QUICK if args.quick else FULL, args.repeats, save)
     print(f"\nWrote {RESULTS / slug}.json and .md")
 
 

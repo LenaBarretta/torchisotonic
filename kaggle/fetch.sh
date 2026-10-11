@@ -3,7 +3,7 @@
 # print the log.
 set -euo pipefail
 cd "$(dirname "$0")"
-KERNEL=ilyabutuzov/torchisotonic-gpu
+KERNEL=lenabarretta/torchisotonic-gpu
 until status=$(kaggle kernels status "$KERNEL" 2>&1); echo "$status" | grep -qiE "complete|error|cancel"; do
   sleep 30
 done
