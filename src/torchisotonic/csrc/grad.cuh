@@ -121,6 +121,52 @@ __device__ void load_tile(
   __syncwarp();
 }
 
+// Sums as unevaluated pairs hi + lo of the working type: the precision of the forward pass's
+// sums, without float64 (1/32 the speed of float32 on a T4; the per-warp scans below were
+// most of the cost of short rows' gradients).
+template <typename T>
+struct P2 {
+  T h, l;
+};
+
+template <typename T>
+__device__ __forceinline__ P2<T> p2(T v) {
+  return {v, T(0)};
+}
+
+template <typename T>
+__device__ __forceinline__ P2<T> p2(double v) {  // exact split of a double
+  const T h = static_cast<T>(v);
+  return {h, static_cast<T>(v - static_cast<double>(h))};
+}
+
+template <typename T>
+__device__ __forceinline__ P2<T> padd(P2<T> a, P2<T> b) {
+  add2(a.h, a.l, b.h, b.l);
+  return a;
+}
+
+template <typename T>
+__device__ __forceinline__ P2<T> psub(P2<T> a, P2<T> b) {
+  return padd(a, P2<T>{-b.h, -b.l});
+}
+
+template <typename T>
+__device__ __forceinline__ P2<T> pshfl(P2<T> v, int src) {
+  return {__shfl_sync(kFull, v.h, src), __shfl_sync(kFull, v.l, src)};
+}
+
+template <typename T>
+__device__ __forceinline__ P2<T> pscan(P2<T> v, int lane) {  // inclusive, over the warp
+  for (int d = 1; d < kLanes; d <<= 1) {
+    const P2<T> o{__shfl_up_sync(kFull, v.h, d), __shfl_up_sync(kFull, v.l, d)};
+    if (lane >= d) {
+      v = padd(v, o);
+    }
+  }
+  return v;
+}
+
 __device__ __forceinline__ double warp_sum(double v) {
   for (int d = 16; d > 0; d >>= 1) {
     v += __shfl_xor_sync(kFull, v, d);
@@ -189,44 +235,35 @@ __global__ void __launch_bounds__(WARPS * kLanes) grad_fill_kernel(
   // lanes in between whole: L + (Q[next] - Q[lane]), Q the prefix sums of F over the lanes.
   // Without a start further in the tile, it is the tile's last block.
   const uint32_t heads = __ballot_sync(kFull, lr.starts != 0);
-  double qg = lr.fg, qw = lr.fw;
-  for (int d = 1; d < kLanes; d <<= 1) {
-    const double og = __shfl_up_sync(kFull, qg, d), ow = __shfl_up_sync(kFull, qw, d);
-    if (lane >= d) {
-      qg += og;
-      qw += ow;
-    }
-  }
-  double first_g, first_w, last_g, last_w;  // the tile's first and last blocks
+  const P2<T> qg = pscan(p2(lr.fg), lane), qw = pscan(p2(lr.fw), lane);
+  P2<T> first_g, first_w, last_g, last_w;  // the tile's first and last blocks
   if constexpr (SINGLE) {
     // The row starts a block at its element 0 (lane 0), so the first block is never needed
     // from outside; the last block is the last lane-with-start's L plus the lanes after it.
     const int last = heads ? 31 - __clz(heads) : 0;
-    const double total_g = __shfl_sync(kFull, qg, kLanes - 1);
-    const double total_w = __shfl_sync(kFull, qw, kLanes - 1);
-    last_g = __shfl_sync(kFull, double(lr.lg), last) + (total_g - __shfl_sync(kFull, qg, last));
-    last_w = __shfl_sync(kFull, double(lr.lw), last) + (total_w - __shfl_sync(kFull, qw, last));
-    first_g = first_w = 0.0;
+    last_g = padd(pshfl(p2(lr.lg), last), psub(pshfl(qg, kLanes - 1), pshfl(qg, last)));
+    last_w = padd(pshfl(p2(lr.lw), last), psub(pshfl(qw, kLanes - 1), pshfl(qw, last)));
+    first_g = first_w = p2(T(0));
   } else {
     const double4 edge = edges[t];
-    first_g = edge.x;
-    first_w = edge.y;
-    last_g = edge.z;
-    last_w = edge.w;
+    first_g = p2<T>(edge.x);
+    first_w = p2<T>(edge.y);
+    last_g = p2<T>(edge.z);
+    last_w = p2<T>(edge.w);
   }
   const uint32_t later = heads & ~((2u << lane) - 1u);
   const int next = later ? __ffs(later) - 1 : 0;
-  const double ng = __shfl_sync(kFull, qg, next), nw = __shfl_sync(kFull, qw, next);
-  double tg = last_g, tw = last_w;  // this lane's last block
+  const P2<T> ng = pshfl(qg, next), nw = pshfl(qw, next);
+  P2<T> tg = last_g, tw = last_w;  // this lane's last block
   if (later) {
-    tg = double(lr.lg) + (ng - qg);
-    tw = double(lr.lw) + (nw - qw);
+    tg = padd(p2(lr.lg), psub(ng, qg));
+    tw = padd(p2(lr.lw), psub(nw, qw));
   }
   // A lane's first block (before its first start) is the last block of the previous lane
   // with a start, or the tile's first block.
   const uint32_t earlier = heads & ((1u << lane) - 1u);
   const int prev = earlier ? 31 - __clz(earlier) : 0;
-  double hg = __shfl_sync(kFull, tg, prev), hw = __shfl_sync(kFull, tw, prev);
+  P2<T> hg = pshfl(tg, prev), hw = pshfl(tw, prev);
   if (!earlier) {
     hg = first_g;
     hw = first_w;
@@ -236,7 +273,7 @@ __global__ void __launch_bounds__(WARPS * kLanes) grad_fill_kernel(
   {
     const int base = lane * (E + 1);
     const int first = lr.starts ? __ffs(lr.starts) - 1 : E;
-    T bg = static_cast<T>(lr.starts ? tg : hg), bw = static_cast<T>(lr.starts ? tw : hw);
+    T bg = lr.starts ? tg.h + tg.l : hg.h + hg.l, bw = lr.starts ? tw.h + tw.l : hw.h + hw.l;
 #pragma unroll
     for (int k = E - 1; k >= 0; --k) {
       if (k < lr.count) {
@@ -250,8 +287,8 @@ __global__ void __launch_bounds__(WARPS * kLanes) grad_fill_kernel(
             bg = lr.pg[k - 1];
             bw = lr.pw[k - 1];
           } else {
-            bg = static_cast<T>(hg);
-            bw = static_cast<T>(hw);
+            bg = hg.h + hg.l;
+            bw = hw.h + hw.l;
           }
         }
       }

@@ -44,6 +44,22 @@ def ours_grad(x: torch.Tensor, g: torch.Tensor) -> object:
     return torch.autograd.grad(torchisotonic.isotonic(xr, increasing=False), xr, g)
 
 
+if "--micro" in sys.argv:
+    # The gradient operator alone (no autograd), same element count, rows of growing length:
+    # how much of its time is per row.
+    from torchisotonic import _ext
+
+    print("| batch x n | grad op ms | ns per row |")
+    print("| --- | ---: | ---: |")
+    for batch, n in [(1_000_000, 16), (1_000_000, 32), (500_000, 32), (250_000, 64),
+                     (125_000, 128), (31_250, 512), (15_625, 1024), (2_000_000, 8)]:  # fmt: skip
+        x = torch.linspace(0, 3, n, device="cuda") + torch.randn(batch, n, device="cuda")
+        fit = torchisotonic.isotonic(x)
+        g = torch.randn(batch, n, device="cuda")
+        ms = best_ms(lambda fit=fit, g=g: _ext.isotonic_grad(fit, g, None, None))
+        print(f"| {batch:,} x {n:,} | {ms:.3f} | {ms * 1e6 / batch:.1f} |", flush=True)
+    sys.exit(0)
+
 try:
     import torchsort.ops as ts
 except ImportError:

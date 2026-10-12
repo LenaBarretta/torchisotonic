@@ -13,7 +13,7 @@ namespace {
 // memory bytes per block, warps per block and resident blocks per SM.
 at::Tensor tiles_phases(const at::Tensor& like, int64_t stop) {
   const c10::cuda::CUDAGuard guard(like.device());
-  at::Tensor out = at::zeros({16}, at::kLong);
+  at::Tensor out = at::zeros({16 + 2 + 3 * kStatRounds}, at::kLong);
   int64_t* o = out.data_ptr<int64_t>();
   C10_CUDA_CHECK(cudaDeviceSynchronize());
   C10_CUDA_CHECK(cudaMemcpyFromSymbol(o, phase_cycles, sizeof(phase_cycles)));
@@ -27,6 +27,14 @@ at::Tensor tiles_phases(const at::Tensor& like, int64_t stop) {
   C10_CUDA_CHECK(cudaFuncGetAttributes(&attr, kernel));
   int blocks = 0;
   C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, warps * kLanes, 0));
+  // [16], [17]: merges, and merges whose walk gave up; [18 + 3 r ..]: round r's nodes,
+  // descriptors, vertices.
+  C10_CUDA_CHECK(cudaMemcpyFromSymbol(o + 16, merge_counts, sizeof(merge_counts)));
+  C10_CUDA_CHECK(cudaMemcpyFromSymbol(o + 18, merge_level_stats, sizeof(merge_level_stats)));
+  const unsigned long long zero2[2] = {};
+  C10_CUDA_CHECK(cudaMemcpyToSymbol(merge_counts, zero2, sizeof(zero2)));
+  static const unsigned long long zero_levels[kStatRounds][3] = {};
+  C10_CUDA_CHECK(cudaMemcpyToSymbol(merge_level_stats, zero_levels, sizeof(zero_levels)));
   o[8] = attr.numRegs;
   o[9] = static_cast<int64_t>(attr.localSizeBytes);
   o[10] = static_cast<int64_t>(attr.sharedSizeBytes);

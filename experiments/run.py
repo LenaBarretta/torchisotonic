@@ -34,12 +34,20 @@ TIME_SHAPES = [(1_000_000, 16), (100_000, 128), (10_000, 1_000), (1_000, 10_000)
 Op = Callable[[torch.Tensor, torch.Tensor | None, bool], torch.Tensor]
 
 
+def consecutive_floats(n: int, dtype: torch.dtype) -> torch.Tensor:
+    """n strictly increasing values exactly representable in dtype: the consecutive floats
+    from 1.0 (float32 has only 2^24 exact integers, so arange would repeat past that)."""
+    if dtype == torch.float32:
+        return (torch.arange(n, dtype=torch.int32) + 0x3F800000).view(torch.float32)
+    return (torch.arange(n, dtype=torch.int64) + 0x3FF0000000000000).view(torch.float64)
+
+
 def pattern(name: str, batch: int, n: int, g: torch.Generator) -> torch.Tensor:
     i = torch.arange(n, dtype=torch.float64).expand(batch, n)
     noise = torch.randn(batch, n, generator=g, dtype=torch.float64)
     return {
         "random": torch.linspace(0, 3, n, dtype=torch.float64) + noise,
-        "increasing": i.clone(),
+        "increasing": consecutive_floats(n, torch.float64).expand(batch, n).clone(),
         "decreasing": -i,
         "saw": i % 7 + (i % 1500) * 0.1,
         "cliff": torch.where(i == n - 1, -1e9, i),
@@ -49,8 +57,13 @@ def pattern(name: str, batch: int, n: int, g: torch.Generator) -> torch.Tensor:
     }[name]
 
 
+ROUNDING = 1e-6  # relative: a float64 difference below this is rounding, not a bug
+
+
 def check(op: Op, ref: Op) -> list[str]:
+    """Shapes and patterns where the variant's fit differs from the package's beyond rounding."""
     failures = []
+    roundings: list[str] = []
     g = torch.Generator().manual_seed(0)
     for batch, n in CHECK_SHAPES:
         for name in (
@@ -72,9 +85,24 @@ def check(op: Op, ref: Op) -> list[str]:
                     want, got = ref(yy, ww, increasing), op(yy, ww, increasing)
                     if not torch.allclose(got, want, rtol=tol, atol=tol, equal_nan=True):
                         err = ((got - want).abs() / (1 + want.abs())).max().item()
+                        if dtype == torch.float64 and err < ROUNDING:
+                            # Rounding-level: say which is closer to the float64 CPU fit.
+                            truth = torchisotonic.isotonic(
+                                yy.cpu(), None if ww is None else ww.cpu(), increasing=increasing
+                            )
+                            e_pkg = ((want.cpu() - truth).abs() / (1 + truth.abs())).max().item()
+                            e_var = ((got.cpu() - truth).abs() / (1 + truth.abs())).max().item()
+                            roundings.append(
+                                f"{batch}x{n} {name} w={weights} inc={increasing}: differ by "
+                                f"{err:.1e}; vs CPU float64: package {e_pkg:.1e}, "
+                                f"variant {e_var:.1e}"
+                            )
+                            continue
                         failures.append(
                             f"{batch}x{n} {name} {dtype} w={weights} inc={increasing}: {err:.2e}"
                         )
+    for r in roundings:
+        print(f"    rounding: {r}", flush=True)
     return failures
 
 
@@ -93,14 +121,30 @@ def best_ms(fn: Callable[[], object], repeats: int = 10) -> float:
 
 
 # Data for the timings: noisy (few hull vertices survive), increasing (every point is a vertex:
-# the most to merge), sawtooth (many short blocks).
-TIME_PATTERNS = ("random", "increasing", "saw")
+# the most to merge - but the fit is then the input, which a trivial check could return), and
+# nearly monotone: consecutive floats jittered by k ulps, so that many vertices survive while
+# the fit does pool; the surviving share falls as k grows. Also sawtooth (many short blocks).
+TIME_PATTERNS = (
+    "random",
+    "increasing",
+    "mono+1ulp",
+    "mono+4ulp",
+    "mono+16ulp",
+    "mono+64ulp",
+    "saw",
+)
 
 
 def timing_data(name: str, batch: int, n: int) -> torch.Tensor:
     i = torch.arange(n, device="cuda", dtype=torch.float32)
-    if name == "increasing":
-        return i.expand(batch, n).contiguous()
+    if name == "increasing":  # every point a hull vertex: strictly increasing, exactly
+        return consecutive_floats(n, torch.float32).cuda().expand(batch, n).contiguous()
+    if name.startswith("mono+"):
+        k = float(name[len("mono+") : -len("ulp")])
+        g = torch.Generator(device="cuda").manual_seed(7)
+        jitter = (k * torch.randn(batch, n, device="cuda", generator=g)).round().to(torch.int32)
+        bits = torch.arange(n, device="cuda", dtype=torch.int32) + 0x3F800000 + jitter
+        return bits.view(torch.float32).contiguous()
     if name == "saw":
         return (i % 7 + (i % 1500) * 0.1).expand(batch, n).contiguous()
     return torch.linspace(0, 3, n, device="cuda") + torch.randn(batch, n, device="cuda")
@@ -108,8 +152,8 @@ def timing_data(name: str, batch: int, n: int) -> torch.Tensor:
 
 STAGES = {
     "chunk": ("chunk_kernel", "packed_kernel"),
-    "merge": ("merge_kernel", "absolutize_kernel"),
-    "fit": ("ends_kernel", "fit_kernel"),
+    "merge": ("merge_kernel", "merge_b3_kernel"),
+    "fit": ("ends_kernel", "fit_kernel"),  # flat_fit_kernel too, by name
 }
 
 
@@ -141,14 +185,19 @@ def main(names: list[str]) -> None:
     folders = [f for f in folders if not names or f.name in names]
     variants: dict[str, Op] = {}
     for folder in folders:
-        cpp_extension.load(
-            name=f"tiexp_{folder.name}",
-            sources=[str(folder / "kernel.cu")],
-            extra_include_paths=[str(CSRC)],
-            extra_cflags=["-O3"],
-            extra_cuda_cflags=["-O3"],
-            is_python_module=False,
-        )
+        try:
+            cpp_extension.load(
+                name=f"tiexp_{folder.name}",
+                sources=[str(folder / "kernel.cu")],
+                extra_include_paths=[str(CSRC)],
+                extra_cflags=["-O3"],
+                extra_cuda_cflags=["-O3"],
+                is_python_module=False,
+            )
+        except RuntimeError as e:  # a build error: report it, test the others
+            lines = [ln for ln in str(e).splitlines() if "error" in ln.lower()][:3]
+            print(f"{folder.name}: DID NOT BUILD\n    " + "\n    ".join(lines), flush=True)
+            continue
         variants[folder.name] = getattr(torch.ops, f"tiexp_{folder.name}").isotonic
         failures = check(variants[folder.name], ref)
         status = "same fits" if not failures else f"{len(failures)} DIFFERENT"
@@ -156,7 +205,15 @@ def main(names: list[str]) -> None:
         for f in failures[:10]:
             print(f"    {f}", flush=True)
     for pattern_name in TIME_PATTERNS:
-        print(f"\n[{pattern_name}] ms (best of 10, warm GPU), package / variant(s):", flush=True)
+        # How much the fit pools on this data: the share of elements not starting a block.
+        probe = timing_data(pattern_name, 1, 10_000_000)
+        fit = ref(probe, None, True)[0]
+        pooled = 1 - (1 + int((fit[1:] != fit[:-1]).sum())) / probe.numel()
+        print(
+            f"\n[{pattern_name}] ms (best of 10, warm GPU), package / variant(s); "
+            f"pooled share of elements on 1x1e7: {100 * pooled:.1f}%",
+            flush=True,
+        )
         print("| batch x n | package | " + " | ".join(variants) + " |")
         print("| --- | ---: |" + " ---: |" * len(variants))
         for batch, n in TIME_SHAPES:

@@ -2,10 +2,11 @@
 // array of vertices (L's up to the bridge, then R's from it: the right part moves down), so a
 // merge costs vertices, not segments. Everything else is the package's: chunk_kernel for the
 // chunks' hulls, the same bridge search (a walk from the shared point, a search when it takes
-// over kSegWalk steps), the same rounds and the same thread-or-warp-per-merge rule.
-//
-// Vertices are kept in the problem's coordinates (the chunk start added once, after
-// chunk_kernel), as doubles like the package's; unweighted, x is the point index.
+// over kSegWalk steps), the same rounds and the same thread-or-warp-per-merge rule, and the
+// same coordinates: a vertex keeps its chunk's coordinates and its chunk id, and the chunk's
+// start is added at every access, exactly as the package's Row::at does. The one other
+// difference is the fit at the end: from one array per problem (flat_fit_kernel) instead of
+// per chunk from its slots and segment; it is timed as its own stage.
 #include "tiles.cuh"
 
 // A named namespace: see experiments/README.md.
@@ -17,11 +18,14 @@ struct Flat {  // a problem's buffer of vertices (slots of chunk + 1 per chunk)
   const double* x;
   const double* y;
   const int32_t* p;
+  const int32_t* c;  // the vertex's chunk
+  const double* cy;  // the problem's chunk starts
+  const double* cx;
 };
 
 template <bool W>
 __device__ __forceinline__ Pt at(const Flat& f, int64_t i) {
-  return Pt{W ? f.x[i] : static_cast<double>(f.p[i]), f.y[i]};
+  return Pt{W ? f.cx[f.c[i]] + f.x[i] : static_cast<double>(f.p[i]), f.cy[f.c[i]] + f.y[i]};
 }
 
 // Where the lower tangent from p touches R's vertices 1..nr-1: as the package's tangent, on
@@ -97,11 +101,11 @@ __device__ void search_flat(
 // destination is before its source).
 template <bool W, bool WARP>
 __device__ void merge_flat(
-    double* vx, double* vy, int32_t* vp, int32_t* cnt, int64_t slots, int64_t first,
-    int64_t half, int lane) {
+    double* vx, double* vy, int32_t* vp, int32_t* vc, const double* cy, const double* cx,
+    int32_t* cnt, int64_t slots, int64_t first, int64_t half, int lane) {
   const int64_t ol = first * slots, orr = (first + half) * slots;
-  const Flat L{W ? vx + ol : nullptr, vy + ol, vp + ol};
-  const Flat R{W ? vx + orr : nullptr, vy + orr, vp + orr};
+  const Flat L{W ? vx + ol : nullptr, vy + ol, vp + ol, vc + ol, cy, cx};
+  const Flat R{W ? vx + orr : nullptr, vy + orr, vp + orr, vc + orr, cy, cx};
   const int nl = cnt[first], nr = cnt[first + half];
   int a = nl - 1, b = 1;  // convex at the shared point: concatenate, the shared point once
   if (turn(at<W>(L, nl - 2), at<W>(L, nl - 1), at<W>(R, 1)) <= 0) {
@@ -124,10 +128,11 @@ __device__ void merge_flat(
     for (int base = 0; base < moved; base += kLanes) {
       const int k = base + lane;
       double x = 0, y = 0;
-      int32_t p = 0;
+      int32_t p = 0, c = 0;
       if (k < moved) {
         y = vy[orr + b + k];
         p = vp[orr + b + k];
+        c = vc[orr + b + k];
         if (W) {
           x = vx[orr + b + k];
         }
@@ -136,6 +141,7 @@ __device__ void merge_flat(
       if (k < moved) {
         vy[ol + a + 1 + k] = y;
         vp[ol + a + 1 + k] = p;
+        vc[ol + a + 1 + k] = c;
         if (W) {
           vx[ol + a + 1 + k] = x;
         }
@@ -146,6 +152,7 @@ __device__ void merge_flat(
     for (int k = 0; k < moved; ++k) {
       vy[ol + a + 1 + k] = vy[orr + b + k];
       vp[ol + a + 1 + k] = vp[orr + b + k];
+      vc[ol + a + 1 + k] = vc[orr + b + k];
       if (W) {
         vx[ol + a + 1 + k] = vx[orr + b + k];
       }
@@ -158,8 +165,8 @@ __device__ void merge_flat(
 
 template <bool W, bool WARP>
 __global__ void flat_merge_kernel(
-    double* vx, double* vy, int32_t* vp, int32_t* cnt, int64_t slots, int64_t batch,
-    int64_t per_row, int64_t half) {
+    double* vx, double* vy, int32_t* vp, int32_t* vc, const double* cy, const double* cx,
+    int32_t* cnt, int64_t slots, int64_t batch, int64_t per_row, int64_t half) {
   const int64_t id = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) /
                      (WARP ? kLanes : 1);
   const int lane = WARP ? threadIdx.x % kLanes : 0;
@@ -168,38 +175,29 @@ __global__ void flat_merge_kernel(
     return;
   }
   const int64_t r = id / pairs;
-  merge_flat<W, WARP>(vx, vy, vp, cnt, slots, r * per_row + id % pairs * 2 * half, half, lane);
+  merge_flat<W, WARP>(vx, vy, vp, vc, cy + r * (per_row + 1), W ? cx + r * (per_row + 1) : nullptr,
+                      cnt, slots, r * per_row + id % pairs * 2 * half, half, lane);
 }
 
-// After chunk_kernel: every vertex into its problem's coordinates, and each chunk's vertex
-// count into cnt (= h.nseg, which chunk_kernel set to 1).
-template <bool W>
-__global__ void absolutize_kernel(
-    Hulls h, const double* cy, const double* cx, int64_t slots, int64_t chunks, int64_t per_row) {
+// After chunk_kernel: every slot's chunk id, and each chunk's vertex count into cnt (= h.nseg,
+// which chunk_kernel set to 1). Coordinates stay the chunks' own.
+__global__ void flat_init_kernel(Hulls h, int32_t* vc, int64_t slots, int64_t chunks, int64_t per_row) {
   const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= chunks * slots) {
     return;
   }
   const int64_t g = i / slots, k = i % slots;
-  const Seg s = h.seg[g];
-  if (k > s.hi) {
-    return;
-  }
-  const int64_t r = g / per_row;
-  h.y[i] += cy[r * (per_row + 1) + s.chunk];
-  if (W) {
-    h.x[i] += cx[r * (per_row + 1) + s.chunk];
-  }
+  vc[i] = static_cast<int32_t>(g % per_row);
   if (k == 0) {
-    h.nseg[g] = s.hi + 1;
+    h.nseg[g] = h.seg[g].hi + 1;
   }
 }
 
 // The fit from one vertex array per problem: a block per kFitSpan elements.
 template <typename scalar_t, bool W>
 __global__ void __launch_bounds__(kThreads) flat_fit_kernel(
-    Hulls h, int64_t slots, int64_t n, int64_t per_row, scalar_t sign,
-    scalar_t* __restrict__ out) {
+    Hulls h, const int32_t* vc, const double* cy, const double* cx, int64_t slots, int64_t n,
+    int64_t per_row, scalar_t sign, scalar_t* __restrict__ out) {
   using acc_t = scalar_t;
   __shared__ int32_t at_[kFitSpan + 2];
   __shared__ acc_t slope[kFitSpan + 2];
@@ -214,6 +212,8 @@ __global__ void __launch_bounds__(kThreads) flat_fit_kernel(
     return;
   }
   const int64_t vb = r * per_row * slots;
+  const Flat f{W ? h.x + vb : nullptr, h.y + vb, h.p + vb, vc + vb, cy + r * (per_row + 1),
+               W ? cx + r * (per_row + 1) : nullptr};
   const int count = h.nseg[r * per_row];
   const int32_t p0 = static_cast<int32_t>(c0), p1 = p0 + len;
   int lo = 0, hi = count;  // the first vertex after p0
@@ -237,13 +237,11 @@ __global__ void __launch_bounds__(kThreads) flat_fit_kernel(
   }
   const int m = lo - first + 1;  // vertices first .. lo
   for (int u = threadIdx.x; u < m; u += blockDim.x) {
-    const int64_t i = vb + first + u;
-    at_[u] = h.p[i];
+    const int64_t i = first + u;
+    at_[u] = h.p[vb + i];
     if (u + 1 < m) {
-      const acc_t dy = static_cast<acc_t>(h.y[i + 1] - h.y[i]);
-      const acc_t dx = W ? static_cast<acc_t>(h.x[i + 1] - h.x[i])
-                         : static_cast<acc_t>(h.p[i + 1] - h.p[i]);
-      slope[u] = dy / dx;
+      const Pt a = at<W>(f, i), b = at<W>(f, i + 1);
+      slope[u] = static_cast<acc_t>((b.y - a.y) / (b.x - a.x));
     }
   }
   __syncthreads();
@@ -287,6 +285,9 @@ at::Tensor isotonic(const at::Tensor& y, const c10::optional<at::Tensor>& w, boo
       constexpr int64_t slots = chunk + 1;
       const scalar_t* yp = y.data_ptr<scalar_t>();
       const scalar_t* wp = W ? w->data_ptr<scalar_t>() : nullptr;
+      const int64_t all = y.size(0) * ((y.size(1) + chunk - 1) / chunk) * slots;
+      at::Tensor chunk_ids = at::empty({all}, y.options().dtype(at::kInt));
+      int32_t* vc = chunk_ids.data_ptr<int32_t>();
       run_chunks<scalar_t, W, chunk>(
           y, W ? &*w : nullptr, increasing, out,
           [&](int64_t chunks, int64_t n, int64_t per_row, scalar_t sign, scalar_t* o, Hulls h,
@@ -298,26 +299,26 @@ at::Tensor isotonic(const at::Tensor& y, const c10::optional<at::Tensor>& w, boo
           [&](Hulls h, const double* cy, const double* cx, int64_t batch, int64_t per_row,
               cudaStream_t stream) {
             const int64_t chunks = batch * per_row;
-            absolutize_kernel<W><<<(chunks * slots + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                h, cy, cx, slots, chunks, per_row);
+            flat_init_kernel<<<(chunks * slots + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+                h, vc, slots, chunks, per_row);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
             for (int64_t half = 1; half < per_row; half *= 2) {
               const int64_t merges = batch * ((per_row + half - 1) / (2 * half));
               if (merges >= kThreadMerges) {
                 flat_merge_kernel<W, false><<<(merges + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-                    h.x, h.y, h.p, h.nseg, slots, batch, per_row, half);
+                    h.x, h.y, h.p, vc, cy, cx, h.nseg, slots, batch, per_row, half);
               } else {
                 flat_merge_kernel<W, true><<<blocks_for_warps(merges), kThreads, 0, stream>>>(
-                    h.x, h.y, h.p, h.nseg, slots, batch, per_row, half);
+                    h.x, h.y, h.p, vc, cy, cx, h.nseg, slots, batch, per_row, half);
               }
               C10_CUDA_KERNEL_LAUNCH_CHECK();
             }
           },
-          [&](Hulls h, const double*, const double*, int64_t batch, int64_t n, int64_t per_row,
-              scalar_t sign, scalar_t* o, cudaStream_t stream) {
+          [&](Hulls h, const double* cy, const double* cx, int64_t batch, int64_t n,
+              int64_t per_row, scalar_t sign, scalar_t* o, cudaStream_t stream) {
             const int64_t spans = (n + kFitSpan - 1) / kFitSpan;
             flat_fit_kernel<scalar_t, W><<<batch * spans, kThreads, 0, stream>>>(
-                h, slots, n, per_row, sign, o);
+                h, vc, cy, cx, slots, n, per_row, sign, o);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
           });
     };

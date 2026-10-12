@@ -55,6 +55,11 @@ constexpr int64_t kThreadMerges = 256;  // rounds with this many merges: a threa
 // phase: 0 load, 1 lane hulls, 2 lane starts, 3 merging lane hulls, 4 writing.
 #ifdef TI_PHASES
 __device__ unsigned long long phase_cycles[8];
+// Merge statistics: per round, nodes / segment descriptors / vertices alive after it; and
+// over all merges, how many there were and how many walks gave up (kSegWalk) for a search.
+constexpr int kStatRounds = 32;
+__device__ unsigned long long merge_level_stats[kStatRounds][3];
+__device__ unsigned long long merge_counts[2];
 #define TI_MARK(i)                                              \
   do {                                                          \
     if (lane == 0) {                                            \
@@ -429,6 +434,12 @@ struct Hulls {  // the chunks' hulls (vertices in their chunk's coordinates) and
   double* total_y;
   double* total_x;
   int32_t* row_nan;
+  // Chunk starts, [batch, per_row + 1], as unevaluated sums hi + lo (the last column: the
+  // row's total). A slope between vertices of different chunks is formed from differences of
+  // these, never from absolute coordinates: at 1e8 elements the absolute sums reach 1e10 and
+  // a difference of two of them loses six digits.
+  const double* cy_lo;
+  const double* cx_lo;
 };
 
 template <typename scalar_t, bool W, int WARPS>
@@ -965,12 +976,58 @@ __device__ __forceinline__ double turn(const Pt& a, const Pt& b, const Pt& d) {
 template <bool W>
 struct Row {  // one problem's vertices, in its coordinates
   Hulls h;
-  const double* cy;  // chunk starts
+  const double* cy;  // chunk starts, hi parts
   const double* cx;
+  const double* cyl = nullptr;  // their lo parts (needed by slope only)
+  const double* cxl = nullptr;
 
+  // The point of vertex (s, pos). With a base set (merge_pair sets the pair's shared point),
+  // the coordinates are relative to it and formed from differences - of the chunk starts' hi
+  // and lo parts and of the chunks' own coordinates - so the turn predicates see the local
+  // geometry, not the rounding of absolute sums ~1e10. Without a base: absolute, for code
+  // that only compares nearby points of one node (experiments) or has none.
   __device__ __forceinline__ Pt at(const Seg& s, int pos) const {
     const int64_t i = s.voff + pos;
-    return Pt{W ? cx[s.chunk] + h.x[i] : static_cast<double>(h.p[i]), cy[s.chunk] + h.y[i]};
+    if (base_chunk < 0) {
+      return Pt{W ? cx[s.chunk] + h.x[i] : static_cast<double>(h.p[i]), cy[s.chunk] + h.y[i]};
+    }
+    const double y = (cy[s.chunk] - cy[base_chunk]) + (cyl[s.chunk] - cyl[base_chunk]) +
+                     (h.y[i] - base_y);
+    double x;
+    if (W) {
+      x = (cx[s.chunk] - cx[base_chunk]) + (cxl[s.chunk] - cxl[base_chunk]) + (h.x[i] - base_x);
+    } else {
+      x = static_cast<double>(h.p[i] - base_p);
+    }
+    return Pt{x, y};
+  }
+
+  // Coordinates relative to vertex (s, pos) from now on.
+  __device__ __forceinline__ void rebase(const Seg& s, int pos) {
+    const int64_t i = s.voff + pos;
+    base_chunk = s.chunk;
+    base_y = h.y[i];
+    base_x = W ? h.x[i] : 0.0;
+    base_p = h.p[i];
+  }
+  int base_chunk = -1;
+  double base_y = 0, base_x = 0;
+  int32_t base_p = 0;
+
+  // The slope of the edge from vertex (sa, pa) to (sb, pb): the chunk starts enter as the
+  // difference of their hi parts (exact when the chunks are close: Sterbenz) plus that of
+  // their lo parts, so the edge keeps the precision of the chunks' own coordinates.
+  __device__ __forceinline__ double slope(const Seg& sa, int pa, const Seg& sb, int pb) const {
+    const int64_t ia = sa.voff + pa, ib = sb.voff + pb;
+    const int ja = sa.chunk, jb = sb.chunk;
+    const double dy = (cy[jb] - cy[ja]) + (cyl[jb] - cyl[ja]) + (h.y[ib] - h.y[ia]);
+    double dx;
+    if (W) {
+      dx = (cx[jb] - cx[ja]) + (cxl[jb] - cxl[ja]) + (h.x[ib] - h.x[ia]);
+    } else {
+      dx = static_cast<double>(h.p[ib] - h.p[ia]);
+    }
+    return dy / dx;
   }
 };
 
@@ -1195,10 +1252,14 @@ __device__ bool walk_segments(
 // 32 parallel candidates would be mostly wasted float64 work). A node's segment list starts
 // at its first chunk's slot; the merged list goes where the left one was.
 template <bool W, bool WARP>
-__device__ void merge_pair(Hulls h, const Row<W>& row, int64_t first, int64_t half, int lane) {
+__device__ void merge_pair(Hulls h, const Row<W>& row0, int64_t first, int64_t half, int lane) {
   Seg* L = h.seg + first;
   const Seg* R = L + half;
   const int nl = h.nseg[first], nr = h.nseg[first + half];
+  Row<W> row = row0;
+  if (row.cyl != nullptr) {
+    row.rebase(L[nl - 1], L[nl - 1].hi);  // the shared point: the origin of this merge
+  }
 
   const Seg last = L[nl - 1], head = R[0];
   const Pt shared = row.at(last, last.hi);
@@ -1216,11 +1277,21 @@ __device__ void merge_pair(Hulls h, const Row<W>& row, int64_t first, int64_t ha
     }
   } else {
     int sa, pa, sb, pb;
-    if (WARP || !walk_segments(row, L, R, nr, nl - 1, last.hi - 1 >= last.lo ? last.hi - 1 : -1,
-                               &sa, &pa, &sb, &pb)) {
+    const bool walked =
+        !WARP && walk_segments(row, L, R, nr, nl - 1, last.hi - 1 >= last.lo ? last.hi - 1 : -1,
+                               &sa, &pa, &sb, &pb);
+    if (!walked) {
       bridge_start<W, WARP>(row, L, nl, R, nr, lane, &sa, &pa);
       tangent(row, R, nr, row.at(L[sa], pa), &sb, &pb);
     }
+#ifdef TI_PHASES
+    if (lane == 0) {
+      atomicAdd(&merge_counts[0], 1ull);
+      if (!walked) {
+        atomicAdd(&merge_counts[1], 1ull);
+      }
+    }
+#endif
     keep = sa + 1;
     hi_l = pa;
     from = sb;
@@ -1274,8 +1345,8 @@ __global__ void merge_kernel(
   if (id >= batch * pairs) {
     return;
   }
-  const int64_t r = id / pairs;
-  const Row<W> row{h, cy + r * (per_row + 1), W ? cx + r * (per_row + 1) : nullptr};
+  const int64_t r = id / pairs, ro = r * (per_row + 1);
+  const Row<W> row{h, cy + ro, W ? cx + ro : nullptr, h.cy_lo + ro, W ? h.cx_lo + ro : nullptr};
   merge_pair<W, WARP>(h, row, r * per_row + id % pairs * 2 * half, half, lane);
 }
 
@@ -1293,7 +1364,8 @@ __global__ void ends_kernel(
   const int32_t j = static_cast<int32_t>(g % per_row);
   const Seg* L = h.seg + r * per_row;
   const int nl = h.nseg[r * per_row];
-  const Row<W> row{h, cy + r * (per_row + 1), W ? cx + r * (per_row + 1) : nullptr};
+  const int64_t ro = r * (per_row + 1);
+  const Row<W> row{h, cy + ro, W ? cx + ro : nullptr, h.cy_lo + ro, W ? h.cx_lo + ro : nullptr};
   int lo = 0, hi = nl - 1;  // the last segment of a chunk <= j
   while (lo < hi) {
     const int mid = (lo + hi + 1) / 2;
@@ -1304,8 +1376,7 @@ __global__ void ends_kernel(
     }
   }
   auto slope = [&](int s) {  // of the edge from segment s's last vertex to s + 1's first
-    const Pt a = row.at(L[s], L[s].hi), b = row.at(L[s + 1], L[s + 1].lo);
-    return (b.y - a.y) / (b.x - a.x);
+    return row.slope(L[s], L[s].hi, L[s + 1], L[s + 1].lo);
   };
   const Seg s = L[lo];
   if (s.chunk == j) {
@@ -1403,6 +1474,80 @@ int64_t blocks_for_warps(int64_t warps) {
   return (warps * kLanes + kThreads - 1) / kThreads;
 }
 
+#ifdef TI_PHASES
+// After a round: the nodes' descriptor counts and vertices alive, summed into round `r`.
+__global__ void merge_stats_kernel(
+    const Seg* seg, const int32_t* nseg, int64_t batch, int64_t per_row, int64_t span, int r) {
+  const int64_t id = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t nodes = (per_row + span - 1) / span;
+  if (id >= batch * nodes) {
+    return;
+  }
+  const int64_t first = (id / nodes) * per_row + (id % nodes) * span;
+  const int n = nseg[first];
+  unsigned long long vertices = 0;
+  for (int i = 0; i < n; ++i) {
+    vertices += seg[first + i].hi - seg[first + i].lo + 1;
+  }
+  atomicAdd(&merge_level_stats[r][0], 1ull);
+  atomicAdd(&merge_level_stats[r][1], static_cast<unsigned long long>(n));
+  atomicAdd(&merge_level_stats[r][2], vertices);
+}
+#endif
+
+// Chunk starts: per row, the exclusive prefix sums of its chunks' totals as hi + lo pairs,
+// plus the row's total in column per_row. One block per row; a thread sums a slice of
+// chunks sequentially (two_sum), the block scans the slices, the thread writes its slice.
+constexpr int kStartThreads = 256;  // 1024 made the double-double code spill registers
+
+// THREADS: 256 for long rows, 32 (one warp, no block scan) for rows of up to 32 chunks.
+template <int THREADS>
+__global__ void __launch_bounds__(THREADS) chunk_starts_kernel(
+    const double* __restrict__ totals, int64_t per_row, double* __restrict__ hi,
+    double* __restrict__ lo) {
+  __shared__ double wh[THREADS / kLanes], wl[THREADS / kLanes];
+  const int64_t r = blockIdx.x, t = threadIdx.x, lane = t % kLanes, warp = t / kLanes;
+  const int64_t per = (per_row + THREADS - 1) / THREADS;
+  const int64_t j0 = t * per, j1 = j0 + per < per_row ? j0 + per : per_row;
+  double sh = 0, sl = 0;  // this thread's slice total
+  for (int64_t j = j0; j < j1; ++j) {
+    add2(sh, sl, totals[r * per_row + j], 0.0);
+  }
+  // Exclusive prefix over the threads: warp scans, then the warps' totals.
+  double ph = sh, pl = sl;
+  for (int d = 1; d < kLanes; d <<= 1) {
+    const double oh = __shfl_up_sync(kFull, ph, d), ol = __shfl_up_sync(kFull, pl, d);
+    if (lane >= d) {
+      add2(ph, pl, oh, ol);
+    }
+  }
+  if (lane == kLanes - 1) {
+    wh[warp] = ph;
+    wl[warp] = pl;
+  }
+  __syncthreads();
+  double oh = 0, ol = 0;
+  for (int v = 0; v < warp; ++v) {
+    add2(oh, ol, wh[v], wl[v]);
+  }
+  double eh = __shfl_up_sync(kFull, ph, 1), el = __shfl_up_sync(kFull, pl, 1);
+  if (lane == 0) {
+    eh = el = 0;
+  }
+  add2(eh, el, oh, ol);  // the exclusive prefix at this thread's first chunk
+  double* oh_row = hi + r * (per_row + 1);
+  double* ol_row = lo + r * (per_row + 1);
+  for (int64_t j = j0; j < j1; ++j) {
+    oh_row[j] = eh;
+    ol_row[j] = el;
+    add2(eh, el, totals[r * per_row + j], 0.0);
+  }
+  if (t == THREADS - 1) {
+    oh_row[per_row] = eh;
+    ol_row[per_row] = el;
+  }
+}
+
 // The chunks' hulls of every problem merged into one, round after round of pairs.
 template <bool W>
 void merge_rounds(
@@ -1418,6 +1563,18 @@ void merge_rounds(
           h, cy, cx, batch, per_row, half);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+#ifdef TI_PHASES
+    {
+      static int round = 0;  // reset by tiles_phases
+      const int64_t nodes = batch * ((per_row + 2 * half - 1) / (2 * half));
+      if (round < kStatRounds) {
+        merge_stats_kernel<<<(nodes + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+            h.seg, h.nseg, batch, per_row, 2 * half, round);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+      }
+      round = half * 2 < per_row ? round + 1 : 0;
+    }
+#endif
   }
 }
 
@@ -1464,16 +1621,27 @@ void run_chunks(
     return;
   }
 
-  // Chunk starts: [batch, per_row + 1], the last column being each problem's total.
-  auto starts = [&](const at::Tensor& totals) {
-    at::Tensor s = at::zeros({batch, per_row + 1}, doubles);
-    s.narrow(1, 1, per_row).copy_(at::cumsum(totals.view({batch, per_row}), 1));
-    return s;
+  // Chunk starts: [batch, per_row + 1] as hi + lo, the last column being each problem's total.
+  auto starts = [&](const at::Tensor& totals, at::Tensor& lo) {
+    at::Tensor hi = at::empty({batch, per_row + 1}, doubles);
+    lo = at::empty({batch, per_row + 1}, doubles);
+    if (per_row <= kLanes) {
+      chunk_starts_kernel<kLanes><<<batch, kLanes, 0, stream>>>(
+          totals.data_ptr<double>(), per_row, hi.data_ptr<double>(), lo.data_ptr<double>());
+    } else {
+      chunk_starts_kernel<kStartThreads><<<batch, kStartThreads, 0, stream>>>(
+          totals.data_ptr<double>(), per_row, hi.data_ptr<double>(), lo.data_ptr<double>());
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return hi;
   };
-  const at::Tensor cy = starts(ty);
-  const at::Tensor cx = W ? starts(tx) : at::Tensor();
+  at::Tensor cy_lo, cx_lo;
+  const at::Tensor cy = starts(ty, cy_lo);
+  const at::Tensor cx = W ? starts(tx, cx_lo) : at::Tensor();
   const double* cyp = cy.data_ptr<double>();
   const double* cxp = W ? cx.data_ptr<double>() : nullptr;
+  h.cy_lo = cy_lo.data_ptr<double>();
+  h.cx_lo = W ? cx_lo.data_ptr<double>() : nullptr;
 
   merge(h, cyp, cxp, batch, per_row, stream);
   finish(h, cyp, cxp, batch, n, per_row, sign, out.data_ptr<scalar_t>(), stream);

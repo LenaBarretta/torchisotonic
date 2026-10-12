@@ -114,3 +114,34 @@ Path("/kaggle/working" if Path("/kaggle/working").exists() else ".").joinpath(
     "sass_chunk_kernel.txt"
 ).write_text("\n".join(lines))
 print(f"wrote {len(lines)} lines of SASS")
+
+
+# Merge statistics (plan: figure 5): per round, nodes / descriptors / vertices alive; walks
+# that gave up for a search.
+def pattern_data(name: str, batch: int, n: int) -> torch.Tensor:
+    i = torch.arange(n, device="cuda", dtype=torch.float32)
+    if name == "increasing":
+        return i.expand(batch, n).contiguous()
+    if name == "saw":
+        return (i % 7 + (i % 1500) * 0.1).expand(batch, n).contiguous()
+    return torch.linspace(0, 3, n, device="cuda") + torch.randn(batch, n, device="cuda")
+
+
+for name in ("random", "increasing", "saw"):
+    for batch, n in [(1, 10_000_000), (100, 100_000)]:
+        x = pattern_data(name, batch, n)
+        ops.isotonic_tiles(x, None, True)
+        ops.tiles_phases(x, 99)  # reset
+        ops.isotonic_tiles(x, None, True)
+        info = ops.tiles_phases(x, 99)
+        merges, gave_up = info[16].item(), info[17].item()
+        rounds = info[18:].view(-1, 3)
+        rounds = rounds[rounds[:, 0] > 0]
+        print(
+            f"--- {name} {batch}x{n}: {merges} merges, {gave_up} walks gave up "
+            f"({100 * gave_up / max(merges, 1):.2f}%)"
+        )
+        print("| round | nodes | descriptors | vertices alive | descriptors per node |")
+        print("| ---: | ---: | ---: | ---: | ---: |")
+        for r, (nodes, descs, verts) in enumerate(rounds.tolist()):
+            print(f"| {r} | {nodes} | {descs} | {verts} | {descs / nodes:.2f} |", flush=True)
