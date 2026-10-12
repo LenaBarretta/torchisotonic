@@ -86,11 +86,15 @@ class _Isotonic(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any, grad: Tensor) -> tuple[Tensor | None, Tensor | None, None]:
         flat_y, flat_w, out = ctx.saved_tensors
+        want_w = ctx.needs_input_grad[1]
+        if out.is_cuda and CUDA_METHOD == "tiles":  # pragma: no cover - needs a GPU
+            gy, gw = _ext.isotonic_grad(out, grad, flat_w, flat_y if want_w else None)
+            return gy if ctx.needs_input_grad[0] else None, gw if want_w else None, None
         w = torch.ones_like(out) if flat_w is None else flat_w
         g_sum, w_sum = _block_sums(out, grad, w)
         mean_grad = g_sum / w_sum  # d(loss) / d(block's mean), per unit of weight
         grad_y = w * mean_grad if ctx.needs_input_grad[0] else None
-        grad_w = (flat_y - out) * mean_grad if ctx.needs_input_grad[1] else None
+        grad_w = (flat_y - out) * mean_grad if want_w else None
         return grad_y, grad_w, None
 
 
@@ -98,11 +102,17 @@ def _block_sums(out: Tensor, *values: Tensor) -> list[Tensor]:
     """For every element, the sums of each of ``values`` over its block of the fit ``out``.
 
     A block is a run of equal fitted values in a row: neighbouring blocks have different
-    means. No host synchronisation: the blocks are numbered by a prefix sum over all rows,
-    and summed into a buffer as long as the whole batch.
+    means. Equal up to 16 units in the last place, which the fit's rounding cannot tell
+    apart: where two neighbouring blocks have the same mean (and the fit is not
+    differentiable), they count as one, whatever computed the fit.
+
+    No host synchronisation: the blocks are numbered by a prefix sum over all rows, and
+    summed into a buffer as long as the whole batch.
     """
     starts = torch.ones_like(out, dtype=torch.bool)
-    starts[:, 1:] = out[:, 1:] != out[:, :-1]
+    a, b = out[:, 1:], out[:, :-1]
+    tol = 16 * torch.finfo(out.dtype).eps  # as grad.cuh's same_block
+    starts[:, 1:] = ~((a - b).abs() <= tol * torch.maximum(a.abs(), b.abs()))
     ids = starts.reshape(-1).cumsum(0) - 1
     sums = []
     for v in values:

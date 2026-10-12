@@ -1422,13 +1422,14 @@ void merge_rounds(
 }
 
 // The whole pipeline for chunks of `chunk` elements, whose hulls (or, for one chunk per
-// problem, fits) launch(chunks, n, per_row, sign, out, hulls, stream) computes, and which
-// merge(hulls, cy, cx, batch, per_row, stream) merges: chunk_kernel and merge_rounds below,
-// or an experiment's (experiments/).
-template <typename scalar_t, bool W, int chunk, typename Launch, typename Merge>
+// problem, fits) launch(chunks, n, per_row, sign, out, hulls, stream) computes, which
+// merge(hulls, cy, cx, batch, per_row, stream) merges, and from which finish(hulls, cy, cx,
+// batch, n, per_row, sign, out, stream) writes the fit: chunk_kernel, merge_rounds and
+// fit_segments below, or an experiment's (experiments/).
+template <typename scalar_t, bool W, int chunk, typename Launch, typename Merge, typename Finish>
 void run_chunks(
     const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out, Launch launch,
-    Merge merge) {
+    Merge merge, Finish finish) {
   constexpr int64_t slots = chunk + 1;  // vertices of a chunk's hull, at most
   const int64_t batch = y.size(0), n = y.size(1);
   const int64_t per_row = (n + chunk - 1) / chunk, chunks = batch * per_row;
@@ -1475,17 +1476,34 @@ void run_chunks(
   const double* cxp = W ? cx.data_ptr<double>() : nullptr;
 
   merge(h, cyp, cxp, batch, per_row, stream);
+  finish(h, cyp, cxp, batch, n, per_row, sign, out.data_ptr<scalar_t>(), stream);
+}
 
-  at::Tensor range = at::empty({chunks * 2}, ints);
-  at::Tensor ends = at::empty({chunks * 2}, doubles);
+// The fit from the merged segment lists: ends_kernel, then fit_kernel.
+template <typename scalar_t, bool W, int chunk>
+void fit_segments(
+    Hulls h, const double* cy, const double* cx, int64_t batch, int64_t n, int64_t per_row,
+    scalar_t sign, scalar_t* out, cudaStream_t stream) {
+  const int64_t chunks = batch * per_row;
+  const auto opts = at::TensorOptions().device(at::kCUDA, at::cuda::current_device());
+  at::Tensor range = at::empty({chunks * 2}, opts.dtype(at::kInt));
+  at::Tensor ends = at::empty({chunks * 2}, opts.dtype(at::kDouble));
   auto* rp = reinterpret_cast<int2*>(range.data_ptr<int32_t>());
   auto* ep = reinterpret_cast<double2*>(ends.data_ptr<double>());
   ends_kernel<W><<<(chunks + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-      h, cyp, cxp, chunks, per_row, rp, ep);
+      h, cy, cx, chunks, per_row, rp, ep);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   fit_kernel<scalar_t, W><<<chunks * (chunk / kFitSpan), kThreads, 0, stream>>>(
-      h, rp, ep, n, per_row, chunk, sign, out.data_ptr<scalar_t>());
+      h, rp, ep, n, per_row, chunk, sign, out);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename scalar_t, bool W, int chunk, typename Launch, typename Merge>
+void run_chunks(
+    const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out, Launch launch,
+    Merge merge) {
+  run_chunks<scalar_t, W, chunk>(
+      y, w, increasing, out, launch, merge, fit_segments<scalar_t, W, chunk>);
 }
 
 template <typename scalar_t, bool W, int chunk, typename Launch>

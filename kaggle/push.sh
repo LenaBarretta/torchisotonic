@@ -4,14 +4,13 @@
 #   kaggle/push.sh tests              # build + tests
 #   kaggle/push.sh tests bench-quick  # ... + a small benchmark
 #   kaggle/push.sh tests torchsort bench
-#   ACCELERATOR=NvidiaTeslaP100 kaggle/push.sh tests bench-quick
 #
-# Then: kaggle kernels status lenabarretta/torchisotonic-gpu
-#       kaggle kernels output lenabarretta/torchisotonic-gpu -p <dir>
+# Then: kaggle kernels status lenabarretta/torchisotonic-bench
+#       kaggle kernels output lenabarretta/torchisotonic-bench -p <dir>
 set -euo pipefail
 cd "$(dirname "$0")/.."
 DATASET=lenabarretta/torchisotonic
-KERNEL=lenabarretta/torchisotonic-gpu
+KERNEL=lenabarretta/torchisotonic-bench
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
@@ -34,10 +33,7 @@ fi
 echo "waiting for the dataset to be ready..."
 until kaggle datasets status "$DATASET" 2>/dev/null | grep -qi ready; do sleep 5; done
 
-# The GPU: NvidiaTeslaT4 unless ACCELERATOR says otherwise (say, NvidiaTeslaP100).
-ACCELERATOR=${ACCELERATOR:-NvidiaTeslaT4}
-sed "s/\"machine_shape\": \"[A-Za-z0-9]*\"/\"machine_shape\": \"$ACCELERATOR\"/" \
-  kaggle/kernel/kernel-metadata.json > "$STAGE/kernel/kernel-metadata.json"
+cp kaggle/kernel/kernel-metadata.json "$STAGE/kernel/"
 steps=$(printf '"%s", ' "${@:-tests}")
 sed "s/^STEPS = .*/STEPS = [${steps%, }]/" kaggle/kernel/run.py > "$STAGE/kernel/run.py"
-kaggle kernels push -p "$STAGE/kernel" --accelerator "$ACCELERATOR"
+kaggle kernels push -p "$STAGE/kernel" --accelerator NvidiaTeslaT4  # Kaggle's only GPU now

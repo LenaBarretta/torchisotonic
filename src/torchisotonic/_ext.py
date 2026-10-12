@@ -35,6 +35,14 @@ def isotonic_tiles(y: Tensor, w: Tensor | None, increasing: bool) -> Tensor:  # 
     return out
 
 
+def isotonic_grad(
+    out: Tensor, g: Tensor, w: Tensor | None, y: Tensor | None
+) -> list[Tensor]:  # pragma: no cover
+    """The gradients of a fit ``out`` (CUDA) with respect to y and, given y, to the weights."""
+    grads: list[Tensor] = _load().isotonic_grad(out, g, w, y)
+    return grads
+
+
 @functools.cache
 def _load() -> Any:
     """``torch.ops.torchisotonic``, compiled for this machine (and its GPU, if any) once."""

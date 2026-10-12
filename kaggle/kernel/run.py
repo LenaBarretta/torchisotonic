@@ -79,8 +79,12 @@ if not failed and "profile" in STEPS:
             clocks.kill()
             clocks.wait()
     sh("sort /tmp/clocks.csv | uniq -c | sort -rn | head -12")
+if not failed and "grad" in STEPS:
+    sh(f"cd {SRC} && python bench/grad.py")
 if not failed and "experiments" in STEPS:
     sh(f"cd {SRC} && python experiments/run.py")
+if not failed and "experiments-profile" in STEPS:
+    sh(f"cd {SRC} && python experiments/run.py --profile")
 if not failed and "phases" in STEPS:
     sh(f"cd {SRC} && python bench/phases.py")
 if not failed and ("bench" in STEPS or "bench-quick" in STEPS):

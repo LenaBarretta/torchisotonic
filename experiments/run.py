@@ -1,6 +1,9 @@
 """Check and time every variant in experiments/ against the package's CUDA operator.
 
-python experiments/run.py [name ...]
+python experiments/run.py [--profile] [name ...]
+
+--profile adds, per timing shape, the GPU time of each stage (chunk hulls, merges, the fit,
+anything else) for the package and every variant, from torch.profiler.
 
 See experiments/README.md.
 """
@@ -8,11 +11,13 @@ See experiments/README.md.
 from __future__ import annotations
 
 import sys
+from collections import defaultdict
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import torch
+from torch.profiler import ProfilerActivity, profile
 from torch.utils import cpp_extension
 
 import torchisotonic
@@ -87,7 +92,49 @@ def best_ms(fn: Callable[[], object], repeats: int = 10) -> float:
     return min(times)
 
 
+# Data for the timings: noisy (few hull vertices survive), increasing (every point is a vertex:
+# the most to merge), sawtooth (many short blocks).
+TIME_PATTERNS = ("random", "increasing", "saw")
+
+
+def timing_data(name: str, batch: int, n: int) -> torch.Tensor:
+    i = torch.arange(n, device="cuda", dtype=torch.float32)
+    if name == "increasing":
+        return i.expand(batch, n).contiguous()
+    if name == "saw":
+        return (i % 7 + (i % 1500) * 0.1).expand(batch, n).contiguous()
+    return torch.linspace(0, 3, n, device="cuda") + torch.randn(batch, n, device="cuda")
+
+
+STAGES = {
+    "chunk": ("chunk_kernel", "packed_kernel"),
+    "merge": ("merge_kernel", "absolutize_kernel"),
+    "fit": ("ends_kernel", "fit_kernel"),
+}
+
+
+def stage_ms(fn: Callable[[], object], repeats: int = 5) -> dict[str, float]:
+    """GPU time per stage of one call, averaged over `repeats` calls."""
+    fn()
+    torch.cuda._sleep(500_000_000)
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(repeats):
+            fn()
+        torch.cuda.synchronize()
+    times: dict[str, float] = defaultdict(float)
+    for event in prof.key_averages():
+        if event.device_type.name != "CUDA":
+            continue
+        stage = next(
+            (s for s, names in STAGES.items() if any(n in event.key for n in names)), "other"
+        )
+        times[stage] += event.self_device_time_total / 1e3 / repeats
+    return times
+
+
 def main(names: list[str]) -> None:
+    do_profile = "--profile" in names
+    names = [n for n in names if n != "--profile"]
     ref_ops: Any = _ext._load()
     ref: Op = ref_ops.isotonic_tiles
     folders = sorted(p.parent for p in HERE.glob("*/kernel.cu"))
@@ -108,17 +155,36 @@ def main(names: list[str]) -> None:
         print(f"{folder.name}: {status}", flush=True)
         for f in failures[:10]:
             print(f"    {f}", flush=True)
-    print("\nms (best of 10, warm T4), package / variant(s):", flush=True)
-    print("| batch x n | package | " + " | ".join(variants) + " |")
-    print("| --- | ---: |" + " ---: |" * len(variants))
-    for batch, n in TIME_SHAPES:
-        y = torch.linspace(0, 3, n, device="cuda") + torch.randn(batch, n, device="cuda")
-        base = best_ms(lambda y=y: ref(y, None, True))
-        cells = []
-        for op in variants.values():
-            t = best_ms(lambda y=y, op=op: op(y, None, True))
-            cells.append(f"{t:.3f} ({base / t:.2f}x)")
-        print(f"| {batch:,} x {n:,} | {base:.3f} | " + " | ".join(cells) + " |", flush=True)
+    for pattern_name in TIME_PATTERNS:
+        print(f"\n[{pattern_name}] ms (best of 10, warm GPU), package / variant(s):", flush=True)
+        print("| batch x n | package | " + " | ".join(variants) + " |")
+        print("| --- | ---: |" + " ---: |" * len(variants))
+        for batch, n in TIME_SHAPES:
+            y = timing_data(pattern_name, batch, n)
+            base = best_ms(lambda y=y: ref(y, None, True))
+            cells = []
+            for op in variants.values():
+                t = best_ms(lambda y=y, op=op: op(y, None, True))
+                cells.append(f"{t:.3f} ({base / t:.2f}x)")
+            print(f"| {batch:,} x {n:,} | {base:.3f} | " + " | ".join(cells) + " |", flush=True)
+        if not do_profile:
+            continue
+        print(f"\n[{pattern_name}] GPU ms per stage (chunk / merge / fit / other):", flush=True)
+        for batch, n in TIME_SHAPES:
+            y = timing_data(pattern_name, batch, n)
+            rows = [("package", stage_ms(lambda y=y: ref(y, None, True)))]
+            rows += [
+                (name, stage_ms(lambda y=y, op=op: op(y, None, True)))
+                for name, op in variants.items()
+            ]
+            for name, t in rows:
+                parts = " / ".join(
+                    f"{t.get(k, 0.0):.3f}" for k in ("chunk", "merge", "fit", "other")
+                )
+                print(
+                    f"| {batch:,} x {n:,} | {name} | {parts} | total {sum(t.values()):.3f} |",
+                    flush=True,
+                )
 
 
 if __name__ == "__main__":

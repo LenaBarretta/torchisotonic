@@ -154,7 +154,11 @@ def test_tiles_patterns(name: str, n: int) -> None:  # pragma: no cover
     both(y.float(), tol=1e-4)
 
 
-@pytest.mark.parametrize(("batch", "n"), [(70, 31), (5, 1000), (3, 5000)])
+@pytest.mark.parametrize(
+    ("batch", "n"),
+    [(70, 31), (70, 32), (9, 33), (9, 64), (9, 65), (7, 128), (5, 512), (5, 513), (5, 1000),
+     (5, 1024), (3, 1025), (3, 5000)],  # every tile size, and the long-row path
+)  # fmt: skip
 def test_gradients_match_cpu(batch: int, n: int) -> None:  # pragma: no cover
     g = torch.Generator().manual_seed(n)
     y = torch.linspace(0, 3, n, dtype=torch.float64) + torch.randn(
@@ -171,3 +175,28 @@ def test_gradients_match_cpu(batch: int, n: int) -> None:  # pragma: no cover
         grads.append((gy.cpu(), gw.cpu()))
     torch.testing.assert_close(grads[1][0], grads[0][0], rtol=1e-9, atol=1e-9)
     torch.testing.assert_close(grads[1][1], grads[0][1], rtol=1e-9, atol=1e-9)
+
+
+@pytest.mark.parametrize("name", PATTERNS)
+@pytest.mark.parametrize("n", [1024, 1025, 3000, 70_000])
+def test_gradient_blocks_across_tiles(name: str, n: int) -> None:  # pragma: no cover
+    # The CUDA gradient sums blocks over tiles of 1024: blocks within, across and over them.
+    g = torch.Generator().manual_seed(n)
+    y = pattern(name, n, g).expand(3, n).contiguous()
+    w = torch.rand(3, n, generator=g, dtype=torch.float64) + 0.1
+    c = torch.randn(3, n, generator=g, dtype=torch.float64)
+    grads: list[tuple[torch.Tensor, ...]] = []
+    for device in ("cpu", "cuda"):
+        yy = y.to(device).requires_grad_()
+        ww = w.to(device).requires_grad_()
+        loss = (torchisotonic.isotonic(yy, ww) * c.to(device)).sum()
+        gy, gw = torch.autograd.grad(loss, (yy, ww))
+        grads.append((gy.cpu(), gw.cpu()))
+        (gy,) = torch.autograd.grad((torchisotonic.isotonic(yy) * c.to(device)).sum(), (yy,))
+        grads.append((gy.cpu(),))
+    torch.testing.assert_close(grads[2][0], grads[0][0], rtol=1e-9, atol=1e-9)
+    torch.testing.assert_close(grads[3][0], grads[1][0], rtol=1e-9, atol=1e-9)
+    # d/dw = (y - fit) G / W: where the fit is y (one-element blocks), the CPU's is y exactly
+    # and the GPU's (a slope of cumulative sums) y up to rounding, so the error scales with y.
+    scale = 1e-9 * (1 + float(y.detach().abs().max()))
+    torch.testing.assert_close(grads[2][1], grads[0][1], rtol=1e-9, atol=scale)

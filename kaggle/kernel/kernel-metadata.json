@@ -1,6 +1,6 @@
 {
-  "id": "lenabarretta/torchisotonic-gpu",
-  "title": "torchisotonic-gpu",
+  "id": "lenabarretta/torchisotonic-bench",
+  "title": "torchisotonic-bench",
   "code_file": "run.py",
   "language": "python",
   "kernel_type": "script",
