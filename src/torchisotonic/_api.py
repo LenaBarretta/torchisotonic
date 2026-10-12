@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from torch import Tensor
 
@@ -36,6 +38,11 @@ def isotonic(
     ``y`` (or broadcast to it). Results are clipped to ``[y_min, y_max]`` if given. A slice
     containing NaN comes back as NaN. Integer input becomes the default float dtype; float
     input keeps its dtype, with float16/bfloat16 computed in float32.
+
+    Differentiable in ``y`` and ``weight``: the fit is constant on blocks of neighbouring
+    elements, each the weighted mean of ``y`` over its block, so a gradient is averaged over
+    the blocks (wherever the blocks do not change, that is everywhere but on a set of measure
+    zero).
     """
     if not isinstance(y, Tensor):
         raise TypeError(f"y must be a torch.Tensor, got {type(y).__name__}")
@@ -61,10 +68,48 @@ def isotonic(
         return y.to(out_dtype, copy=True)
     flat_y = rows.reshape(-1, shape[-1]).to(acc)
     flat_w = None if w is None else w.reshape(-1, shape[-1])
-    out = _solve(flat_y, flat_w, increasing)
+    out: Tensor = _Isotonic.apply(flat_y, flat_w, increasing)
     if y_min is not None or y_max is not None:
         out = out.clamp(min=y_min, max=y_max)
     return out.reshape(shape).movedim(-1, dim).to(out_dtype)
+
+
+class _Isotonic(torch.autograd.Function):
+    """_solve, with the gradient of the fit: averaging over its blocks."""
+
+    @staticmethod
+    def forward(ctx: Any, flat_y: Tensor, flat_w: Tensor | None, increasing: bool) -> Tensor:
+        out = _solve(flat_y, flat_w, increasing)
+        ctx.save_for_backward(flat_y, flat_w, out)
+        return out
+
+    @staticmethod
+    def backward(ctx: Any, grad: Tensor) -> tuple[Tensor | None, Tensor | None, None]:
+        flat_y, flat_w, out = ctx.saved_tensors
+        w = torch.ones_like(out) if flat_w is None else flat_w
+        g_sum, w_sum = _block_sums(out, grad, w)
+        mean_grad = g_sum / w_sum  # d(loss) / d(block's mean), per unit of weight
+        grad_y = w * mean_grad if ctx.needs_input_grad[0] else None
+        grad_w = (flat_y - out) * mean_grad if ctx.needs_input_grad[1] else None
+        return grad_y, grad_w, None
+
+
+def _block_sums(out: Tensor, *values: Tensor) -> list[Tensor]:
+    """For every element, the sums of each of ``values`` over its block of the fit ``out``.
+
+    A block is a run of equal fitted values in a row: neighbouring blocks have different
+    means. No host synchronisation: the blocks are numbered by a prefix sum over all rows,
+    and summed into a buffer as long as the whole batch.
+    """
+    starts = torch.ones_like(out, dtype=torch.bool)
+    starts[:, 1:] = out[:, 1:] != out[:, :-1]
+    ids = starts.reshape(-1).cumsum(0) - 1
+    sums = []
+    for v in values:
+        total = torch.zeros(out.numel(), dtype=v.dtype, device=v.device)
+        total.index_add_(0, ids, v.reshape(-1))
+        sums.append(total[ids].reshape(out.shape))
+    return sums
 
 
 def _solve(flat_y: Tensor, flat_w: Tensor | None, increasing: bool) -> Tensor:

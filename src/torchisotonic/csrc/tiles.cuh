@@ -1195,20 +1195,10 @@ __device__ bool walk_segments(
 // 32 parallel candidates would be mostly wasted float64 work). A node's segment list starts
 // at its first chunk's slot; the merged list goes where the left one was.
 template <bool W, bool WARP>
-__global__ void merge_kernel(
-    Hulls h, const double* cy, const double* cx, int64_t batch, int64_t per_row, int64_t half) {
-  const int64_t id = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) /
-                     (WARP ? kLanes : 1);
-  const int lane = WARP ? threadIdx.x % kLanes : 0;
-  const int64_t pairs = (per_row + half - 1) / (2 * half);
-  if (id >= batch * pairs) {
-    return;
-  }
-  const int64_t r = id / pairs, first = r * per_row + id % pairs * 2 * half;
+__device__ void merge_pair(Hulls h, const Row<W>& row, int64_t first, int64_t half, int lane) {
   Seg* L = h.seg + first;
   const Seg* R = L + half;
   const int nl = h.nseg[first], nr = h.nseg[first + half];
-  const Row<W> row{h, cy + r * (per_row + 1), W ? cx + r * (per_row + 1) : nullptr};
 
   const Seg last = L[nl - 1], head = R[0];
   const Pt shared = row.at(last, last.hi);
@@ -1272,6 +1262,21 @@ __global__ void merge_kernel(
   if (lane == 0) {
     h.nseg[first] = keep + moved;
   }
+}
+
+template <bool W, bool WARP>
+__global__ void merge_kernel(
+    Hulls h, const double* cy, const double* cx, int64_t batch, int64_t per_row, int64_t half) {
+  const int64_t id = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) /
+                     (WARP ? kLanes : 1);
+  const int lane = WARP ? threadIdx.x % kLanes : 0;
+  const int64_t pairs = (per_row + half - 1) / (2 * half);
+  if (id >= batch * pairs) {
+    return;
+  }
+  const int64_t r = id / pairs;
+  const Row<W> row{h, cy + r * (per_row + 1), W ? cx + r * (per_row + 1) : nullptr};
+  merge_pair<W, WARP>(h, row, r * per_row + id % pairs * 2 * half, half, lane);
 }
 
 // Per chunk: its surviving vertices lo..hi (none: lo > hi) and the slopes of the edges into
@@ -1398,12 +1403,32 @@ int64_t blocks_for_warps(int64_t warps) {
   return (warps * kLanes + kThreads - 1) / kThreads;
 }
 
+// The chunks' hulls of every problem merged into one, round after round of pairs.
+template <bool W>
+void merge_rounds(
+    Hulls h, const double* cy, const double* cx, int64_t batch, int64_t per_row,
+    cudaStream_t stream) {
+  for (int64_t half = 1; half < per_row; half *= 2) {
+    const int64_t merges = batch * ((per_row + half - 1) / (2 * half));
+    if (merges >= kThreadMerges) {
+      merge_kernel<W, false><<<(merges + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
+          h, cy, cx, batch, per_row, half);
+    } else {
+      merge_kernel<W, true><<<blocks_for_warps(merges), kThreads, 0, stream>>>(
+          h, cy, cx, batch, per_row, half);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+}
+
 // The whole pipeline for chunks of `chunk` elements, whose hulls (or, for one chunk per
-// problem, fits) launch(chunks, n, per_row, sign, out, hulls, stream) computes: chunk_kernel's
-// launch below, or an experiment's (experiments/).
-template <typename scalar_t, bool W, int chunk, typename Launch>
+// problem, fits) launch(chunks, n, per_row, sign, out, hulls, stream) computes, and which
+// merge(hulls, cy, cx, batch, per_row, stream) merges: chunk_kernel and merge_rounds below,
+// or an experiment's (experiments/).
+template <typename scalar_t, bool W, int chunk, typename Launch, typename Merge>
 void run_chunks(
-    const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out, Launch launch) {
+    const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out, Launch launch,
+    Merge merge) {
   constexpr int64_t slots = chunk + 1;  // vertices of a chunk's hull, at most
   const int64_t batch = y.size(0), n = y.size(1);
   const int64_t per_row = (n + chunk - 1) / chunk, chunks = batch * per_row;
@@ -1449,17 +1474,7 @@ void run_chunks(
   const double* cyp = cy.data_ptr<double>();
   const double* cxp = W ? cx.data_ptr<double>() : nullptr;
 
-  for (int64_t half = 1; half < per_row; half *= 2) {
-    const int64_t merges = batch * ((per_row + half - 1) / (2 * half));
-    if (merges >= kThreadMerges) {
-      merge_kernel<W, false><<<(merges + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-          h, cyp, cxp, batch, per_row, half);
-    } else {
-      merge_kernel<W, true><<<blocks_for_warps(merges), kThreads, 0, stream>>>(
-          h, cyp, cxp, batch, per_row, half);
-    }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-  }
+  merge(h, cyp, cxp, batch, per_row, stream);
 
   at::Tensor range = at::empty({chunks * 2}, ints);
   at::Tensor ends = at::empty({chunks * 2}, doubles);
@@ -1471,6 +1486,12 @@ void run_chunks(
   fit_kernel<scalar_t, W><<<chunks * (chunk / kFitSpan), kThreads, 0, stream>>>(
       h, rp, ep, n, per_row, chunk, sign, out.data_ptr<scalar_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename scalar_t, bool W, int chunk, typename Launch>
+void run_chunks(
+    const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out, Launch launch) {
+  run_chunks<scalar_t, W, chunk>(y, w, increasing, out, launch, merge_rounds<W>);
 }
 
 template <typename scalar_t, bool W, int warps>

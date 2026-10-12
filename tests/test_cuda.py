@@ -152,3 +152,22 @@ def test_tiles_patterns(name: str, n: int) -> None:  # pragma: no cover
     both(y, w, tol=1e-9)
     both(y, w, tol=1e-9, increasing=False)
     both(y.float(), tol=1e-4)
+
+
+@pytest.mark.parametrize(("batch", "n"), [(70, 31), (5, 1000), (3, 5000)])
+def test_gradients_match_cpu(batch: int, n: int) -> None:  # pragma: no cover
+    g = torch.Generator().manual_seed(n)
+    y = torch.linspace(0, 3, n, dtype=torch.float64) + torch.randn(
+        batch, n, generator=g, dtype=torch.float64
+    )
+    w = torch.rand(batch, n, generator=g, dtype=torch.float64) + 0.1
+    c = torch.randn(batch, n, generator=g, dtype=torch.float64)
+    grads = []
+    for device in ("cpu", "cuda"):
+        yy = y.to(device).requires_grad_()
+        ww = w.to(device).requires_grad_()
+        loss = (torchisotonic.isotonic(yy, ww, increasing=False) * c.to(device)).sum()
+        gy, gw = torch.autograd.grad(loss, (yy, ww))
+        grads.append((gy.cpu(), gw.cpu()))
+    torch.testing.assert_close(grads[1][0], grads[0][0], rtol=1e-9, atol=1e-9)
+    torch.testing.assert_close(grads[1][1], grads[0][1], rtol=1e-9, atol=1e-9)
