@@ -57,6 +57,12 @@ if os.path.exists(f"{SRC}/SOURCE"):
     with open(f"{SRC}/SOURCE") as f:
         print(f.read(), flush=True)
 
+for step in STEPS:  # csrc:<dir>: build and run the package with these sources instead
+    if step.startswith("csrc:"):
+        csrc = f"{SRC}/src/torchisotonic/csrc"
+        shutil.rmtree(csrc)
+        shutil.copytree(f"{SRC}/{step[5:]}", csrc)
+        print(f"sources: {step[5:]}", flush=True)
 sh("nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv")
 sh("pip install -q pytest pytest-cov hypothesis scipy scikit-learn ninja")
 sh(f"pip install -q --no-deps --force-reinstall {SRC}")
@@ -98,6 +104,8 @@ if not failed and "debug-weighted" in STEPS:
     sh(f"cd {SRC} && python bench/debug_weighted.py")
 if not failed and "accuracy" in STEPS:
     sh(f"cd {SRC} && python bench/accuracy.py")
+if not failed and "accuracy-fast" in STEPS:
+    sh(f"cd {SRC} && python bench/accuracy.py --fast")
 if not failed and "experiments" in STEPS:
     sh(f"cd {SRC} && python experiments/run.py")
 if not failed and "experiments-profile" in STEPS:
@@ -123,6 +131,8 @@ if not failed and "sweep" in STEPS:  # for the paper's figures: one row of growi
     sh(f"cat {SRC}/bench/results/*-sweep.md")
     sh(f"cd {SRC} && python experiments/sweep.py {OUT}/merge-sweep.json")
     sh(f"cp -r {SRC}/bench/results {OUT}/results")
+if not failed and "merge-sweep" in STEPS:  # the merge stage alone, of the same sweep
+    sh(f"cd {SRC} && python experiments/sweep.py {OUT}/merge-sweep.json")
 if not failed and "phases" in STEPS:
     sh(f"cd {SRC} && python bench/phases.py")
 for step in STEPS:  # phases:<dir>: the phases of another copy of the sources

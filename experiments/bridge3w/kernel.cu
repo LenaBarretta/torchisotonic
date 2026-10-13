@@ -1,10 +1,9 @@
-// The package's merge rounds with the bridge found as in notes/theorem-merge-depth.md: a
-// walk from the shared point for at most T_r = 2 (r + log2 C) steps on round r, then the
-// three-case search over edges (Gaede, Goertz, van der Hoog, Krogh, Rotenberg, ALENEX 2024,
-// mirrored to lower hulls) in O(log |L| + log |R|) steps, bisecting first over segments, then
-// within one. The scheduling is the package's: a thread per merge in rounds of many merges
-// (where the three-case search is used), a warp per merge after that (the package's own
-// warp-parallel search, which hides memory latency; the depth bound is unchanged).
+// The package's merge rounds with the bridge found by a walk from the shared point for at
+// most T_r = 8 (r + log2 C) steps on round r, then the three-case search over edges (Gaede,
+// Goertz, van der Hoog, Krogh, Rotenberg, ALENEX 2024, mirrored to lower hulls) in
+// O(log |L| + log |R|) steps, bisecting first over segments, then within one. The scheduling
+// is the package's: a thread per merge in rounds of many merges, where the three-case search
+// is used, and a warp per merge after that, with the package's own warp-parallel search.
 #include "tiles.cuh"
 
 // A named namespace: see experiments/README.md.

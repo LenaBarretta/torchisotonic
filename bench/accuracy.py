@@ -1,6 +1,6 @@
 """How exact the fit is, on hard data: not only its distance from a reference.
 
-    python bench/accuracy.py [--device cuda|cpu] [--max-n N]
+    python bench/accuracy.py [--device cuda|cpu] [--max-n N] [--fast]
 
 For every data pattern, length, dtype and weighting, the fit is checked for
 
@@ -91,9 +91,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--max-n", type=int, default=10_000_000)
+    parser.add_argument("--fast", action="store_true", help="the fit with exact=False")
     args = parser.parse_args()
     lengths = [n for n in (1_000, 100_000, 10_000_000) if n <= args.max_n]
-    print(f"device {args.device}, torch {torch.__version__}")
+    print(f"device {args.device}, torch {torch.__version__}, exact={not args.fast}")
     print("| pattern | n | dtype | weights | monotone | error | objective | KKT | blocks |")
     print("| --- | ---: | --- | --- | ---: | ---: | ---: | ---: | --- |")
     worst: dict[str, float] = {}
@@ -107,7 +108,9 @@ def main() -> None:
                     y64, w64 = y.double(), None if w is None else w.double()
                     ref = torchisotonic.isotonic(y64, w64)
                     fit = torchisotonic.isotonic(
-                        y.to(args.device), None if w is None else w.to(args.device)
+                        y.to(args.device),
+                        None if w is None else w.to(args.device),
+                        exact=not args.fast,
                     )
                     fit = fit.double().cpu()
                     ones = torch.ones(n, dtype=torch.float64)
