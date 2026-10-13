@@ -48,8 +48,11 @@ image = (
     .apt_install("git")
     .pip_install("torch==2.11.0", index_url="https://download.pytorch.org/whl/cu128")
     .pip_install("numpy", "scipy", "scikit-learn", "pytest", "pytest-cov", "hypothesis", "ninja")
-    # torchsort's pyproject.toml does not load with setuptools 70 or later
-    .pip_install("setuptools<70", "wheel")
+    # torchsort's packaging loads with setuptools 69.5 (69.0, the image's, and 70 or later fail)
+    .pip_install("setuptools==69.5.1", "wheel")
+    # This Python was built with clang, which the image lacks; extensions built through
+    # setuptools (torchsort's) would ask for clang++ otherwise.
+    .env({"CC": "gcc", "CXX": "g++"})
 )
 if modal.is_local():
     for name in tracked_files():
