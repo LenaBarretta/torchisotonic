@@ -15,7 +15,8 @@ requires-python = ">=3.10"
 dependencies = ["torch>=2.4", "ninja"]
 keywords = ["pytorch", "torch", "isotonic-regression", "calibration", "pava", "cuda", "gpu"]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU :: NVIDIA CUDA",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Programming Language :: Python :: 3",
@@ -52,7 +53,13 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.hatch.build.targets.sdist]
-exclude = ["bench", "notebooks", "docs", "kaggle", "experiments", "examples", "cloud", ".github"]
+# The sources, the tests (with docs/hull_prototype.py, which one of them checks), README and
+# licence. notes/ is kept out of git through .git/info/exclude, which hatch does not read, so it
+# is listed here too.
+exclude = [
+    "bench", "notebooks", "kaggle", "experiments", "examples", "cloud", ".github",
+    "notes", "uv.lock",
+]
 
 [tool.hatch.version]
 path = "src/torchisotonic/__init__.py"
