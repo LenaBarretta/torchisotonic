@@ -4,6 +4,7 @@
     python bench/bench.py --quick    # small grid, to check that everything runs
     python bench/bench.py --gpu-only # the GPU columns alone (a cloud container's CPU says
                                      # nothing, and the scipy loop would take hours on it)
+    python bench/bench.py --sweep    # one row of 2^14 .. 2^27 elements (with --gpu-only)
 
 Every implementation solves the same problems: a batch of decreasing, unweighted isotonic
 regressions (the only kind torchsort solves) of float32 data shaped [batch, n], noisy
@@ -38,6 +39,7 @@ QUICK = [
     (1_000, 10_000),
     (1, 10_000_000),
 ]
+SWEEP = [(1, 1 << k) for k in range(14, 28)]
 RESULTS = Path(__file__).parent / "results"
 Fn = Callable[[], object]
 
@@ -145,13 +147,14 @@ def main() -> None:
     parser.add_argument("--quick", action="store_true", help="small grid")
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--gpu-only", action="store_true", help="skip the CPU columns")
+    parser.add_argument("--sweep", action="store_true", help="one row of growing length")
     args = parser.parse_args()
     if torch.cuda.is_available():
         device = torch.cuda.get_device_name(0)
     else:
         device = f"CPU ({platform.processor() or platform.machine()})"
     RESULTS.mkdir(exist_ok=True)
-    slug = re.sub(r"[^a-z0-9]+", "-", device.lower()).strip("-")
+    slug = re.sub(r"[^a-z0-9]+", "-", device.lower()).strip("-") + ("-sweep" if args.sweep else "")
     meta = {
         "device": device,
         "torch": torch.__version__,
@@ -162,7 +165,8 @@ def main() -> None:
         (RESULTS / f"{slug}.json").write_text(json.dumps({**meta, "rows": rows}, indent=1))
         (RESULTS / f"{slug}.md").write_text(markdown(rows, device))
 
-    run(QUICK if args.quick else FULL, args.repeats, save, args.gpu_only)
+    grid = SWEEP if args.sweep else QUICK if args.quick else FULL
+    run(grid, args.repeats, save, args.gpu_only)
     print(f"\nWrote {RESULTS / slug}.json and .md")
 
 

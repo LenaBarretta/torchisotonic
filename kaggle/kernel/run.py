@@ -118,6 +118,11 @@ if not failed and "example-ctr" in STEPS:
         sh(f"cd {SRC} && python {script} --data {data[0]} --out {OUT}/ctr")
     else:
         print("example-ctr: the Criteo dataset is not attached", flush=True)
+if not failed and "sweep" in STEPS:  # for the paper's figures: one row of growing length
+    sh(f"cd {SRC} && python bench/bench.py --gpu-only --sweep")
+    sh(f"cat {SRC}/bench/results/*-sweep.md")
+    sh(f"cd {SRC} && python experiments/sweep.py {OUT}/merge-sweep.json")
+    sh(f"cp -r {SRC}/bench/results {OUT}/results")
 if not failed and "phases" in STEPS:
     sh(f"cd {SRC} && python bench/phases.py")
 for step in STEPS:  # phases:<dir>: the phases of another copy of the sources
