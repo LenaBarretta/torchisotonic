@@ -37,6 +37,25 @@ def test_block_average() -> None:
     torch.testing.assert_close(grad, torch.full((3,), 3.0))
 
 
+def close_values() -> list[torch.Tensor]:
+    """Strictly increasing rows whose neighbours are a few units in the last place apart."""
+    one = torch.tensor(1.0).view(torch.int32)
+    consecutive = (one + torch.arange(1000, dtype=torch.int32)).view(torch.float32)  # from 1 up
+    return [consecutive[None], torch.linspace(0, 1, 10**6)[None]]
+
+
+@pytest.mark.parametrize("row", range(2))
+def test_close_values_are_separate_blocks(row: int) -> None:
+    # Increasing data is its own fit, every element a block: the gradient passes unchanged,
+    # however close the neighbours.
+    y = close_values()[row].requires_grad_()
+    c = torch.randn(y.shape, generator=torch.Generator().manual_seed(row))
+    out = torchisotonic.isotonic(y)
+    assert torch.equal(out, y)
+    (grad,) = torch.autograd.grad((out * c).sum(), (y,))
+    assert torch.equal(grad, c)
+
+
 def test_weights_alone_and_broadcast() -> None:
     y = torch.randn(3, 8, dtype=torch.float64)
     w = (torch.rand(8, dtype=torch.float64) + 0.1).requires_grad_()  # broadcast over rows

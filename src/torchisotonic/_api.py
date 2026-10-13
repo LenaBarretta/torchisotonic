@@ -109,18 +109,16 @@ class _Isotonic(torch.autograd.Function):
 def _block_sums(out: Tensor, *values: Tensor) -> list[Tensor]:
     """For every element, the sums of each of ``values`` over its block of the fit ``out``.
 
-    A block is a run of equal fitted values in a row: neighbouring blocks have different
-    means. Values within 16 units in the last place count as equal, since the fit's rounding
-    cannot tell them apart; so two neighbouring blocks with the same mean (where the fit is
-    not differentiable) count as one, whatever computed the fit.
+    A block is a run of equal fitted values in a row, as in grad.cuh's same_block: every
+    solver writes one value per block (or per hull edge), so a block's values are equal
+    exactly. Two neighbouring blocks whose means round to the same value count as one; the fit
+    is not differentiable there, and either side's derivative is as valid.
 
     No host synchronisation: the blocks are numbered by a prefix sum over all rows, and
     summed into a buffer as long as the whole batch.
     """
     starts = torch.ones_like(out, dtype=torch.bool)
-    a, b = out[:, 1:], out[:, :-1]
-    tol = 16 * torch.finfo(out.dtype).eps  # as grad.cuh's same_block
-    starts[:, 1:] = ~((a - b).abs() <= tol * torch.maximum(a.abs(), b.abs()))
+    starts[:, 1:] = out[:, 1:] != out[:, :-1]
     ids = starts.reshape(-1).cumsum(0) - 1
     sums = []
     for v in values:

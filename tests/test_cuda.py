@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 import torch
+from test_grad import close_values
 
 import torchisotonic
 from torchisotonic import _api
@@ -216,9 +217,27 @@ def test_gradient_blocks_across_tiles(name: str, n: int) -> None:  # pragma: no 
         grads.append((gy.cpu(), gw.cpu()))
         (gy,) = torch.autograd.grad((torchisotonic.isotonic(yy) * c.to(device)).sum(), (yy,))
         grads.append((gy.cpu(),))
+    if name == "constant":
+        # Every neighbour ties, so the fit is differentiable nowhere and the blocks are
+        # whatever the rounding of each device makes them. Any blocks pass the gradient's sum
+        # over a row on unchanged, as each spreads its share by weight.
+        for got in grads:
+            torch.testing.assert_close(got[0].sum(1), c.sum(1), rtol=1e-9, atol=1e-9)
+        return
     torch.testing.assert_close(grads[2][0], grads[0][0], rtol=1e-9, atol=1e-9)
     torch.testing.assert_close(grads[3][0], grads[1][0], rtol=1e-9, atol=1e-9)
     # d/dw = (y - fit) G / W: where the fit is y (one-element blocks), the CPU's is y exactly
     # and the GPU's (a slope of cumulative sums) y up to rounding, so the error scales with y.
     scale = 1e-9 * (1 + float(y.detach().abs().max()))
     torch.testing.assert_close(grads[2][1], grads[0][1], rtol=1e-9, atol=scale)
+
+
+@pytest.mark.parametrize("row", range(2))
+@pytest.mark.parametrize("batch", [1, 3])
+def test_gradient_close_values(row: int, batch: int) -> None:  # pragma: no cover
+    # Neighbours a few units in the last place apart are still separate blocks on the GPU:
+    # increasing data is its own fit, so the gradient passes unchanged.
+    y = close_values()[row].expand(batch, -1).contiguous().cuda().requires_grad_()
+    c = torch.randn(y.shape, generator=torch.Generator().manual_seed(row)).cuda()
+    (grad,) = torch.autograd.grad((torchisotonic.isotonic(y) * c).sum(), (y,))
+    assert torch.equal(grad, c)

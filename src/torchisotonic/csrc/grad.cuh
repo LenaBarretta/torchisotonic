@@ -1,7 +1,7 @@
 // The gradient of the fit on CUDA: torchisotonic::isotonic_grad.
 //
-// The fit is constant on blocks - runs of equal fitted values in a row (equal up to rounding:
-// same_block) - each the weighted mean of y over its block, so with g the gradient with
+// The fit is constant on blocks - runs of equal fitted values in a row (same_block) - each
+// the weighted mean of y over its block, so with g the gradient with
 // respect to the fit, and G and W the sums of g and w over an element's block:
 //
 //   d/dy_i = w_i G / W,   d/dw_i = (y_i - fit_i) G / W.
@@ -28,13 +28,15 @@ namespace torchisotonic {
 
 namespace {
 
-// Whether neighbouring fitted values a and b belong to one block: equal up to 16 units in the
-// last place, as the fit's own rounding cannot tell them apart (blocks whose means are equal
-// - a point where the fit is not differentiable - are then one, on any device).
+// Whether neighbouring fitted values a and b belong to one block: whether they are equal.
+// Every element under one hull edge gets the same value, the edge's slope, so a block's
+// values are equal exactly; any tolerance would join distinct neighbouring values, and a
+// chain of them over a whole row. Two neighbouring blocks whose means round to the same
+// value count as one: there the fit is not differentiable, and either side's derivative is
+// as valid.
 template <typename T>
 __device__ __forceinline__ bool same_block(T a, T b) {
-  const T scale = fabs(a) > fabs(b) ? fabs(a) : fabs(b);
-  return fabs(a - b) <= T(16) * std::numeric_limits<T>::epsilon() * scale;
+  return a == b;
 }
 
 // Lane l's elements at l * (E + 1) + k: reading one element per lane hits E + 1 banks apart.
