@@ -241,3 +241,22 @@ def test_gradient_close_values(row: int, batch: int) -> None:  # pragma: no cove
     c = torch.randn(y.shape, generator=torch.Generator().manual_seed(row)).cuda()
     (grad,) = torch.autograd.grad((torchisotonic.isotonic(y) * c).sum(), (y,))
     assert torch.equal(grad, c)
+
+
+@pytest.mark.parametrize("name", ["collinear", "offset", "consecutive"])
+@pytest.mark.parametrize("n", [1000, 100_000])
+def test_float32_fit_is_monotone(name: str, n: int) -> None:  # pragma: no cover
+    # Where neighbouring slopes are within an ulp of each other, as rounded float32 values
+    # they must still not step down.
+    g = torch.Generator().manual_seed(n)
+    i = torch.arange(n, dtype=torch.float64)
+    one = torch.tensor(1.0).view(torch.int32)
+    y = {
+        "collinear": 1e6 + 1e-3 * i + 1e-9 * torch.randn(n, generator=g, dtype=torch.float64),
+        "offset": 1e6 + torch.randn(n, generator=g, dtype=torch.float64),
+        "consecutive": (one + torch.arange(n, dtype=torch.int32)).view(torch.float32).double(),
+    }[name].float()
+    u = torch.rand(n, generator=g)
+    for w in (None, u + 0.1, torch.exp(8 * u)):
+        fit = torchisotonic.isotonic(y.cuda(), None if w is None else w.cuda())
+        assert bool((fit[1:] >= fit[:-1]).all())

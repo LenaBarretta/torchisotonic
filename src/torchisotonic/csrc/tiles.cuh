@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
+#include <type_traits>
 
 namespace torchisotonic {
 
@@ -205,6 +206,22 @@ template <typename T>
 struct Pair {
   T h, l;
 };
+
+// The slope dy / dx of pairs, rounded once: a faithful float32 quotient of the hi parts,
+// corrected by its remainder, which fma gives exactly; the result is the rounding of a value
+// within about u^2 of the exact slope, so it is monotone in the slope but for near-ties of
+// that size. No division: a reciprocal and multiplications.
+template <typename acc_t>
+__device__ __forceinline__ acc_t rounded_slope(const Pair<acc_t>& dy, const Pair<acc_t>& dx) {
+  if constexpr (std::is_same_v<acc_t, float>) {
+    const float r = __frcp_rn(dx.h);
+    const float q = dy.h * r;
+    const float e = (fmaf(-q, dx.h, dy.h) + dy.l) - q * dx.l;
+    return fmaf(e, r, q);
+  } else {
+    return (dy.h + dy.l) / (dx.h + dx.l);
+  }
+}
 
 // (ah + al) - (bh + bl) as a pair.
 template <typename T>
@@ -866,7 +883,7 @@ __global__ void __launch_bounds__(WARPS * kLanes) chunk_kernel(
           } else {
             delta(c, pa, pn, dx, dy);
           }
-          slope[k] = sign * ((dy.h + dy.l) / (dx.h + dx.l));
+          slope[k] = sign * rounded_slope(dy, dx);
           if (!found) {
             last = slope[k];
             found = true;
@@ -1111,7 +1128,7 @@ __global__ void __launch_bounds__(WARPS * kLanes) packed_kernel(
         const Pair<acc_t> dy = diff2(pn.yh, pn.yl, pa.yh, pa.yl);
         const Pair<acc_t> dx = W ? diff2(pn.xh, pn.xl, pa.xh, pa.xl)
                                  : Pair<acc_t>{to_acc<acc_t>(nv - p0 - k), acc_t(0)};
-        slope[k] = sign * ((dy.h + dy.l) / (dx.h + dx.l));
+        slope[k] = sign * rounded_slope(dy, dx);
         if (!found) {
           last = slope[k];
           found = true;
@@ -1672,10 +1689,12 @@ __global__ void __launch_bounds__(kThreads) fit_kernel(
     const int64_t i = vb + first + u;
     at[u] = h.p[i];
     if (first + u < rg.y) {
-      const acc_t dy = static_cast<acc_t>(h.y[i + 1] - h.y[i]);
-      const acc_t dx = W ? static_cast<acc_t>(h.x[i + 1] - h.x[i])
-                         : static_cast<acc_t>(h.p[i + 1] - h.p[i]);
-      slope[u] = dy / dx;
+      // In double, rounded once, as the slopes across chunks (ends_kernel): neighbouring
+      // slopes then compare as the exact ones do, but for ties far below float32's
+      // resolution, and the float32 fit does not step down.
+      const double dy = h.y[i + 1] - h.y[i];
+      const double dx = W ? h.x[i + 1] - h.x[i] : static_cast<double>(h.p[i + 1] - h.p[i]);
+      slope[u] = static_cast<acc_t>(dy / dx);
     } else {
       slope[u] = static_cast<acc_t>(en.y);
     }

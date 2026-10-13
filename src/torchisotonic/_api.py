@@ -47,8 +47,9 @@ def isotonic(
 
     ``exact=False`` makes float32 on the GPU about twice as fast for short and medium rows,
     at the cost of accuracy on hard inputs: with strongly varying weights, or increments near
-    float32's resolution, the fit may be off by up to about 1e-3 of the data's scale and pool
-    points that should stay apart. It has no effect on float64 or on the CPU.
+    float32's resolution, the fit may be off by a few parts in a thousand, step down by up to
+    about 1e-3 of the data's scale and pool points that should stay apart. It has no effect on
+    float64 or on the CPU.
     """
     if not isinstance(y, Tensor):
         raise TypeError(f"y must be a torch.Tensor, got {type(y).__name__}")
