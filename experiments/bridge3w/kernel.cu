@@ -2,8 +2,9 @@
 // walk from the shared point for at most T_r = 2 (r + log2 C) steps on round r, then the
 // three-case search over edges (Gaede, Goertz, van der Hoog, Krogh, Rotenberg, ALENEX 2024,
 // mirrored to lower hulls) in O(log |L| + log |R|) steps, bisecting first over segments, then
-// within one. The scheduling is the package's: a thread per merge in rounds of many merges, a
-// warp per merge after that (lane 0 searches, the warp moves the segments).
+// within one. The scheduling is the package's: a thread per merge in rounds of many merges
+// (where the three-case search is used), a warp per merge after that (the package's own
+// warp-parallel search, which hides memory latency; the depth bound is unchanged).
 #include "tiles.cuh"
 
 // A named namespace: see experiments/README.md.
@@ -254,17 +255,16 @@ __device__ void merge_pair_b3(
     }
   } else {
     int sa = 0, pa = 0, sb = 0, pb = 0;
-    if (lane == 0) {
+    if constexpr (WARP) {
+      // Few, long merges: the package's warp-parallel search hides the memory latency that
+      // a sequential O(log) search by one lane would pay in full.
+      bridge_start<W, true>(row, L.p, nl, R.p, nr, lane, &sa, &pa);
+      tangent(row, R.p, nr, row.at(L[sa], pa), L.p, sa, pa, &sb, &pb);
+    } else {
       if (!walk_capped(row, L, R, nr, nl - 1, last.hi - 1 >= last.lo ? last.hi - 1 : -1, limit,
                        &sa, &pa, &sb, &pb)) {
         bridge_three_cases(row, L, nl, R, nr, &sa, &pa, &sb, &pb);
       }
-    }
-    if (WARP) {
-      sa = __shfl_sync(kFull, sa, 0);
-      pa = __shfl_sync(kFull, pa, 0);
-      sb = __shfl_sync(kFull, sb, 0);
-      pb = __shfl_sync(kFull, pb, 0);
     }
     keep = sa + 1;
     hi_l = pa;

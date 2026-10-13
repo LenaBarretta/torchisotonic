@@ -973,50 +973,81 @@ __device__ __forceinline__ double turn(const Pt& a, const Pt& b, const Pt& d) {
   return (b.x - a.x) * (d.y - a.y) - (b.y - a.y) * (d.x - a.x);
 }
 
+// The biased exponent of |v| (0 for zero and subnormals), from the high word: integer work.
+__device__ __forceinline__ int bexp(double v) {
+  return static_cast<int>((static_cast<unsigned>(__double2hiint(v)) << 1) >> 21);
+}
+
 template <bool W>
 struct Row {  // one problem's vertices, in its coordinates
   Hulls h;
   const double* cy;  // chunk starts, hi parts
   const double* cx;
-  const double* cyl = nullptr;  // their lo parts (needed by slope only)
+  const double* cyl = nullptr;  // their lo parts (needed by slope and the exact turn only)
   const double* cxl = nullptr;
 
-  // The point of vertex (s, pos). With a base set (merge_pair sets the pair's shared point),
-  // the coordinates are relative to it and formed from differences - of the chunk starts' hi
-  // and lo parts and of the chunks' own coordinates - so the turn predicates see the local
-  // geometry, not the rounding of absolute sums ~1e10. Without a base: absolute, for code
-  // that only compares nearby points of one node (experiments) or has none.
+  // Absolute coordinates, one addition each: cheap, and exact enough for most predicates.
   __device__ __forceinline__ Pt at(const Seg& s, int pos) const {
     const int64_t i = s.voff + pos;
-    if (base_chunk < 0) {
-      return Pt{W ? cx[s.chunk] + h.x[i] : static_cast<double>(h.p[i]), cy[s.chunk] + h.y[i]};
+    return Pt{W ? cx[s.chunk] + h.x[i] : static_cast<double>(h.p[i]), cy[s.chunk] + h.y[i]};
+  }
+
+  // The turn of a, b, d (> 0: a left turn), with a floating-point filter. The absolute
+  // coordinates are sums of up to 1e10 rounded to double, so the cross product computed from
+  // them carries an error of up to a few ulp of that magnitude times the edge lengths; if the
+  // result is larger than that bound its sign is right. Otherwise - nearly collinear points,
+  // or far from the origin - it is recomputed from coordinates relative to a, formed from
+  // differences of the chunk starts' hi and lo parts and of the chunks' own coordinates,
+  // which see the local geometry; for that the points are named again as (list, segment,
+  // position), which the callers have at hand - a Pt carries nothing but its coordinates, so
+  // that the fast path keeps the registers of the plain cross product. Without lo parts, the
+  // cheap result is returned as it is.
+  //
+  // The bound is compared by exponents, in integer arithmetic on the doubles' high words:
+  // the merges of this GPU are bound by its double throughput (1/32 of the float rate), the
+  // cross product itself is seven double operations, and a bound in double or float (the
+  // conversions run at the double rate too) doubled the merge time. With u = 2^-53 the error
+  // is below 8u (M (|bx| + |by| + |dx| + |dy|) + |p1| + |p2|) <= 16u M (|bx| + |by| + |dx| +
+  // |dy|) for M the largest coordinate, as |p1| + |p2| <= M (|bx| + |by|) (correctness.md).
+  // Bounding each factor by a power of two from its exponent, M <= 2^(E_m + 1) with E_m <=
+  // max(E_a, E_e) + 1 over a's coordinates and the four differences, and the sum of
+  // differences by 2^(E_e + 3), gives a bound of at most 2^(E_m + E_e - 45), and |c| >=
+  // 2^E_c for a normal c. Zero and subnormal results take the exact path.
+  __device__ __forceinline__ double turn(
+      const Pt& a, const Pt& b, const Pt& d, const Seg* A, int as, int ap, const Seg* B, int bs,
+      int bp, const Seg* D, int ds, int dp) const {
+    const double bx = b.x - a.x, by = b.y - a.y, dx = d.x - a.x, dy = d.y - a.y;
+    const double p1 = bx * dy, p2 = by * dx, c = p1 - p2;
+    const int ea = imax(bexp(a.x), bexp(a.y));
+    const int ee = imax(imax(bexp(bx), bexp(by)), imax(bexp(dx), bexp(dy)));
+    const int em = imax(ea, ee) + 1;
+    // Biased exponents: E = e - 1023, so the condition E_c >= E_m + E_e - 44 reads
+    // e_c >= e_m + e_e - 1067.
+    if (bexp(c) >= em + ee - 1067 || cyl == nullptr) {
+      return c;
     }
-    const double y = (cy[s.chunk] - cy[base_chunk]) + (cyl[s.chunk] - cyl[base_chunk]) +
-                     (h.y[i] - base_y);
-    double x;
+    double rbx, rby, rdx, rdy;
+    rel(A[as], ap, B[bs], bp, rbx, rby);
+    rel(A[as], ap, D[ds], dp, rdx, rdy);
+    return rbx * rdy - rby * rdx;
+  }
+
+  // Vertex (sv, pv) minus vertex (sa, pa), from differences: of the chunk starts' hi parts
+  // (exact when the chunks are close: Sterbenz), of their lo parts, and of the chunks' own
+  // coordinates.
+  __device__ __forceinline__ void rel(
+      const Seg& sa, int pa, const Seg& sv, int pv, double& x, double& y) const {
+    const int64_t ia = sa.voff + pa, iv = sv.voff + pv;
+    const int ja = sa.chunk, jv = sv.chunk;
+    y = (cy[jv] - cy[ja]) + (cyl[jv] - cyl[ja]) + (h.y[iv] - h.y[ia]);
     if (W) {
-      x = (cx[s.chunk] - cx[base_chunk]) + (cxl[s.chunk] - cxl[base_chunk]) + (h.x[i] - base_x);
+      x = (cx[jv] - cx[ja]) + (cxl[jv] - cxl[ja]) + (h.x[iv] - h.x[ia]);
     } else {
-      x = static_cast<double>(h.p[i] - base_p);
+      x = static_cast<double>(h.p[iv] - h.p[ia]);
     }
-    return Pt{x, y};
   }
 
-  // Coordinates relative to vertex (s, pos) from now on.
-  __device__ __forceinline__ void rebase(const Seg& s, int pos) {
-    const int64_t i = s.voff + pos;
-    base_chunk = s.chunk;
-    base_y = h.y[i];
-    base_x = W ? h.x[i] : 0.0;
-    base_p = h.p[i];
-  }
-  int base_chunk = -1;
-  double base_y = 0, base_x = 0;
-  int32_t base_p = 0;
-
-  // The slope of the edge from vertex (sa, pa) to (sb, pb): the chunk starts enter as the
-  // difference of their hi parts (exact when the chunks are close: Sterbenz) plus that of
-  // their lo parts, so the edge keeps the precision of the chunks' own coordinates.
+  // The slope of the edge from vertex (sa, pa) to (sb, pb), from the same differences.
   __device__ __forceinline__ double slope(const Seg& sa, int pa, const Seg& sb, int pb) const {
     const int64_t ia = sa.voff + pa, ib = sb.voff + pb;
     const int ja = sa.chunk, jb = sb.chunk;
@@ -1071,10 +1102,13 @@ __device__ int first_false(int count, int lane, Pred pred) {
   }
 }
 
-// Where the lower tangent from p, left of the right hull R, touches it (not at its first
-// vertex, the one shared with the left hull): segment *ts, position *tp. One thread.
+// Where the lower tangent from p = vertex (ps, pp) of list P, left of the right hull R,
+// touches it (not at its first vertex, the one shared with the left hull): segment *ts,
+// position *tp. One thread.
 template <bool W>
-__device__ void tangent(const Row<W>& row, const Seg* R, int nr, const Pt& p, int* ts, int* tp) {
+__device__ void tangent(
+    const Row<W>& row, const Seg* R, int nr, const Pt& p, const Seg* P, int ps, int pp, int* ts,
+    int* tp) {
   // Slopes from p fall, then rise, along R. First narrow it down by segments' first vertices
   // to (first of segment s - 1, first of segment s + 1], then search that window.
   int sa = 0, pa = R[0].lo + 1, na = R[0].hi - R[0].lo;  // window part A: after a first vertex
@@ -1085,7 +1119,8 @@ __device__ void tangent(const Row<W>& row, const Seg* R, int nr, const Pt& p, in
     while (lo < hi) {
       const int mid = (lo + hi) / 2;
       const Seg u = R[mid], v = R[mid + 1];
-      if (turn(p, row.at(u, u.lo), row.at(v, v.lo)) < 0) {
+      if (row.turn(p, row.at(u, u.lo), row.at(v, v.lo), P, ps, pp, R, mid, u.lo, R, mid + 1,
+                   v.lo) < 0) {
         lo = mid + 1;
       } else {
         hi = mid;
@@ -1122,7 +1157,8 @@ __device__ void tangent(const Row<W>& row, const Seg* R, int nr, const Pt& p, in
     int s0, p0, s1, p1;
     vertex(mid, &s0, &p0);
     vertex(mid + 1, &s1, &p1);
-    if (turn(p, row.at(R[s0], p0), row.at(R[s1], p1)) < 0) {
+    if (row.turn(p, row.at(R[s0], p0), row.at(R[s1], p1), P, ps, pp, R, s0, p0, R, s1, p1) <
+        0) {
       lo = mid + 1;
     } else {
       hi = mid;
@@ -1139,10 +1175,11 @@ __device__ void bridge_start(
   auto further = [&](int s, int pos) {  // the bridge starts right of vertex (s, pos)
     const Seg cs = L[s];
     const Pt p = row.at(cs, pos);
-    const Pt next = pos < cs.hi ? row.at(cs, pos + 1) : row.at(L[s + 1], L[s + 1].lo);
+    const int ns = pos < cs.hi ? s : s + 1, np = pos < cs.hi ? pos + 1 : L[s + 1].lo;
+    const Pt next = row.at(L[ns], np);
     int ts, tp;
-    tangent(row, R, nr, p, &ts, &tp);
-    return turn(p, row.at(R[ts], tp), next) < 0;
+    tangent(row, R, nr, p, L, s, pos, &ts, &tp);
+    return row.turn(p, row.at(R[ts], tp), next, L, s, pos, R, ts, tp, L, ns, np) < 0;
   };
   // Candidates: every vertex but the shared one. By segments' first vertices first...
   const int firsts = L[nl - 1].lo == L[nl - 1].hi ? nl - 1 : nl;
@@ -1210,7 +1247,7 @@ __device__ bool walk_segments(
         np = R[ns].lo;
       }
       const Pt q = row.at(R[ns], np);
-      if (turn(a, b, q) > 0) {
+      if (row.turn(a, b, q, L, ls, lp, R, rs, rp, R, ns, np) > 0) {
         break;
       }
       rs = ns;
@@ -1228,7 +1265,7 @@ __device__ bool walk_segments(
         np = L[ns].hi;
       }
       const Pt q = row.at(L[ns], np);
-      if (turn(q, a, b) > 0) {
+      if (row.turn(q, a, b, L, ns, np, L, ls, lp, R, rs, rp) > 0) {
         break;
       }
       ls = ns;
@@ -1252,21 +1289,19 @@ __device__ bool walk_segments(
 // 32 parallel candidates would be mostly wasted float64 work). A node's segment list starts
 // at its first chunk's slot; the merged list goes where the left one was.
 template <bool W, bool WARP>
-__device__ void merge_pair(Hulls h, const Row<W>& row0, int64_t first, int64_t half, int lane) {
+__device__ void merge_pair(Hulls h, const Row<W>& row, int64_t first, int64_t half, int lane) {
   Seg* L = h.seg + first;
   const Seg* R = L + half;
   const int nl = h.nseg[first], nr = h.nseg[first + half];
-  Row<W> row = row0;
-  if (row.cyl != nullptr) {
-    row.rebase(L[nl - 1], L[nl - 1].hi);  // the shared point: the origin of this merge
-  }
 
   const Seg last = L[nl - 1], head = R[0];
   const Pt shared = row.at(last, last.hi);
-  const Pt before = last.hi > last.lo ? row.at(last, last.hi - 1) : row.at(L[nl - 2], L[nl - 2].hi);
-  const Pt after = head.hi > head.lo ? row.at(head, head.lo + 1) : row.at(R[1], R[1].lo);
+  const int bs = last.hi > last.lo ? nl - 1 : nl - 2, bp = last.hi > last.lo ? last.hi - 1 : L[nl - 2].hi;
+  const int as = head.hi > head.lo ? 0 : 1, ap = head.hi > head.lo ? head.lo + 1 : R[1].lo;
+  const Pt before = row.at(L[bs], bp), after = row.at(R[as], ap);
   int keep, hi_l, from, lo_r;  // L keeps segments [0, keep), the last up to hi_l; then R's from `from`
-  if (turn(before, shared, after) > 0) {  // convex at the shared point: concatenate
+  if (row.turn(before, shared, after, L, bs, bp, L, nl - 1, last.hi, R, as, ap) > 0) {
+    // Convex at the shared point: concatenate.
     keep = nl;
     hi_l = last.hi;
     from = 0;
@@ -1282,7 +1317,7 @@ __device__ void merge_pair(Hulls h, const Row<W>& row0, int64_t first, int64_t h
                                &sa, &pa, &sb, &pb);
     if (!walked) {
       bridge_start<W, WARP>(row, L, nl, R, nr, lane, &sa, &pa);
-      tangent(row, R, nr, row.at(L[sa], pa), &sb, &pb);
+      tangent(row, R, nr, row.at(L[sa], pa), L, sa, pa, &sb, &pb);
     }
 #ifdef TI_PHASES
     if (lane == 0) {

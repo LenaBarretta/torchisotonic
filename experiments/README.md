@@ -19,5 +19,8 @@ builds them, checks that each gives the package's fits (on shapes and data patte
 hit lane, chunk and problem edges), and times each against the package on the benchmark's
 shapes. A variant that wins is moved into `tiles.cuh`; one that does not is deleted with its
 folder, unless it is kept as a control for a comparison (`materialized`: the package's
-segment lists against copying the merged hulls' vertices). Nothing outside `experiments/` refers to a variant. `kaggle/push.sh experiments` (or
-`experiments-profile`) runs it on a T4.
+segment lists against copying the merged hulls' vertices; `merge_v9`: the merges with plain
+double predicates on absolute coordinates, against the package's filtered exact ones - the
+cost of exactness). Nothing outside `experiments/` refers to a variant. `kaggle/push.sh experiments` (or
+`experiments-profile`, `experiments-each`, or `variant:<name>` for one variant with the
+profile) runs it on a T4.

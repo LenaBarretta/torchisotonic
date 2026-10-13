@@ -10,6 +10,7 @@ See experiments/README.md.
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from collections import defaultdict
 from collections.abc import Callable
@@ -157,6 +158,20 @@ STAGES = {
 }
 
 
+def resource_usage(name: str) -> None:
+    """Registers, spills and shared memory of the merge kernels of a built extension."""
+    so = next(Path(cpp_extension._get_build_directory(name, False)).glob("*.so"), None)
+    if so is None:
+        return
+    dump = subprocess.run(["cuobjdump", "-res-usage", str(so)], capture_output=True, text=True)
+    lines = dump.stdout.splitlines()
+    for i, line in enumerate(lines):
+        if "Function" in line and "merge" in line and i + 1 < len(lines):
+            fn = line.split()[-1].rstrip(":")
+            demangled = subprocess.run(["c++filt", fn], capture_output=True, text=True).stdout
+            print(f"    {demangled.strip()[:90]}\n        {lines[i + 1].strip()}", flush=True)
+
+
 def stage_ms(fn: Callable[[], object], repeats: int = 5) -> dict[str, float]:
     """GPU time per stage of one call, averaged over `repeats` calls."""
     fn()
@@ -181,6 +196,9 @@ def main(names: list[str]) -> None:
     names = [n for n in names if n != "--profile"]
     ref_ops: Any = _ext._load()
     ref: Op = ref_ops.isotonic_tiles
+    if do_profile:
+        print("package: merge kernels", flush=True)
+        resource_usage("torchisotonic_ops")
     folders = sorted(p.parent for p in HERE.glob("*/kernel.cu"))
     folders = [f for f in folders if not names or f.name in names]
     variants: dict[str, Op] = {}
@@ -191,14 +209,17 @@ def main(names: list[str]) -> None:
                 sources=[str(folder / "kernel.cu")],
                 extra_include_paths=[str(CSRC)],
                 extra_cflags=["-O3"],
-                extra_cuda_cflags=["-O3"],
+                extra_cuda_cflags=["-O3", "-Xptxas", "-v"],
                 is_python_module=False,
+                verbose=True,
             )
         except RuntimeError as e:  # a build error: report it, test the others
             lines = [ln for ln in str(e).splitlines() if "error" in ln.lower()][:3]
             print(f"{folder.name}: DID NOT BUILD\n    " + "\n    ".join(lines), flush=True)
             continue
         variants[folder.name] = getattr(torch.ops, f"tiexp_{folder.name}").isotonic
+        if do_profile:
+            resource_usage(f"tiexp_{folder.name}")
         failures = check(variants[folder.name], ref)
         status = "same fits" if not failures else f"{len(failures)} DIFFERENT"
         print(f"{folder.name}: {status}", flush=True)
