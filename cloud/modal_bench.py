@@ -2,6 +2,7 @@
 
     modal run cloud/modal_bench.py --gpu A100-40GB --steps "tests accuracy profile"
     modal run cloud/modal_bench.py --gpu H100 --steps "tests accuracy profile grad experiments-each"
+    modal run --detach ...  # keeps running if this machine sleeps; the log stays in Modal's
 
 The working tree (what git tracks or would track, so not notes/ or kaggle/output/) is copied
 into the container; the log is printed and saved to cloud/output/<gpu>-<time>.log.
@@ -68,14 +69,22 @@ def run(steps: str, source: str) -> str:
     Path(f"{REMOTE}/SOURCE").write_text(source)
     env = dict(os.environ, TI_SRC=REMOTE, TI_OUT="/root/out", TI_STEPS=steps)
     Path("/root/out").mkdir(exist_ok=True)
-    done = subprocess.run(
+    # Printed as it goes, so that Modal keeps the log even if the local client disconnects.
+    proc = subprocess.Popen(
         ["python", f"{REMOTE}/kaggle/kernel/run.py"],
         env=env,
         cwd=REMOTE,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
     )
-    return done.stdout + done.stderr
+    lines = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        lines.append(line)
+    proc.wait()
+    return "".join(lines)
 
 
 @app.local_entrypoint()

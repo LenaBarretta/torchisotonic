@@ -23,7 +23,17 @@ The semantics are scikit-learn's: weights must be strictly positive (a weight of
 `y`, or one that broadcasts to it), the result is clipped to `[y_min, y_max]` if they are
 given, `dim` picks the axis, and a row holding a NaN comes back as NaN. Float input keeps its
 dtype (float16 and bfloat16 are computed in float32), integer input becomes the default
-float dtype.
+float dtype. The fit is differentiable in `y` and in the weights.
+
+On the GPU, float32 is exact to the format's rounding by default. `exact=False` makes it about
+1.5–2 times faster on short and medium rows, at the cost of errors up to about 1e-3 of the
+data's scale on hard inputs (strongly varying weights, increments near float32's resolution);
+float64 is unaffected.
+
+Rows of unequal length go in one batch padded at the end with a value above each row's maximum
+(below its minimum for `increasing=False`): the padding never pools with the data, so the fit
+of each row is exactly its own. Rows of very different lengths fit faster laid end to end in a single row,
+as [`examples/ctr_calibration`](examples/ctr_calibration) does.
 
 **Status: pre-alpha.** Not on PyPI yet; the API may change. The C++/CUDA code is compiled the
 first time it is used (about a minute), which needs `ninja`, a C++ compiler and, for the GPU,
@@ -39,26 +49,27 @@ On an NVIDIA T4 (Kaggle), float32, unweighted, decreasing fits of data noisy aro
 in milliseconds; best of ten calls on a warmed-up GPU, data already on the device for the GPU
 columns:
 
-| batch × n | torchisotonic (cuda) | torchsort (cuda) | torchisotonic (cpu) | torchsort (cpu) | scipy, a loop over rows |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 1,000,000 × 16 | **1.05** | — | 387 | 650 | 13,309 |
-| 100,000 × 128 | **1.22** | — | 282 | 488 | 1,479 |
-| 10,000 × 1,000 | **0.80** | 101 | 154 | 338 | 300 |
-| 1,000 × 10,000 | **1.07** | 197 | 153 | 347 | 168 |
-| 100 × 100,000 | **1.18** | 396 | 152 | 344 | 161 |
-| 10 × 1,000,000 | **1.31** | 1,658 | 153 | 349 | 165 |
-| 1 × 10,000,000 | **1.35** | 5,493 | 247 | 341 | 184 |
-| 100 × 1,000 | **0.06** | 3.0 | 1.6 | 3.2 | 2.5 |
-| 10 × 10,000 | **0.19** | 14.0 | 1.5 | 3.2 | 1.6 |
-| 1 × 100,000 | **0.24** | 51.7 | 1.6 | 3.3 | 1.5 |
-| 1 × 1,000,000 | **0.40** | 550 | 16.6 | 32.9 | 14.7 |
-| 1 × 100,000,000 | **9.98** | — | 3,386 | — | — |
+| batch × n | torchisotonic (cuda) | `exact=False` | torchsort (cuda) | torchisotonic (cpu) | torchsort (cpu) | scipy, a loop over rows |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000,000 × 16 | **2.15** | 1.20 | — | 407 | 677 | 14,363 |
+| 100,000 × 128 | **1.66** | 1.29 | — | 280 | 492 | 1,613 |
+| 10,000 × 1,000 | **2.15** | 1.18 | 101 | 160 | 354 | 318 |
+| 1,000 × 10,000 | **1.70** | 1.15 | 197 | 160 | 358 | 178 |
+| 100 × 100,000 | **1.82** | 1.22 | 396 | 158 | 352 | 166 |
+| 10 × 1,000,000 | **1.94** | 1.35 | 1,654 | 157 | 357 | 170 |
+| 1 × 10,000,000 | **2.06** | 1.47 | 5,482 | 236 | 355 | 176 |
+| 100 × 1,000 | **0.09** | 0.07 | 3.0 | 1.7 | 3.5 | 2.9 |
+| 10 × 10,000 | **0.21** | 0.20 | 14.0 | 1.7 | 3.5 | 1.6 |
+| 1 × 100,000 | **0.26** | 0.26 | 51.6 | 1.8 | 3.5 | 1.6 |
+| 1 × 1,000,000 | **0.50** | 0.44 | 548 | 17.9 | 35.0 | 15.5 |
+| 1 × 100,000,000 | **16.7** | 10.8 | — | 3,552 | — | — |
 
 torchsort (cuda) was not run with more than 10⁷ elements (a single call would take minutes);
 the CPU columns are on Kaggle's CPU, so they say how the libraries compare, not how fast a
-good CPU is. Reading the input and writing the fit at the T4's 320 GB/s takes 0.25 ms for 10⁷
-float32 elements and 2.5 ms for 10⁸: the GPU code is a few times above that, bound by the
-instructions the hull takes rather than by memory. `bench/bench.py` reproduces the table.
+good CPU is. A plain copy of 10⁸ float32 elements on the T4 takes 3.4 ms: the GPU code is a few
+times above that, bound by the instructions the hull takes rather than by memory. On an L4 and
+an A100 one row of 10⁷ elements takes 1.2 and 0.8 ms, and 10⁸ elements 8.0 and 4.3 ms.
+`bench/bench.py` reproduces the table.
 
 ## How it works
 

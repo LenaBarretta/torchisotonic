@@ -225,6 +225,19 @@ def auc(p: torch.Tensor, y: torch.Tensor) -> float:
     return (float(mean_rank[pos].sum()) - n1 * (n1 + 1) / 2) / (n1 * n0)
 
 
+def paired_logloss_gain(p_a: torch.Tensor, p_b: torch.Tensor, y: torch.Tensor) -> dict[str, float]:
+    """How much lower b's log-loss is than a's on the same rows: the mean of the per-row
+    differences, with its standard error and a normal 95% interval."""
+
+    def per_row(p: torch.Tensor) -> torch.Tensor:
+        q = p.clamp(1e-7, 1 - 1e-7)
+        return -(y * q.log() + (1 - y) * (1 - q).log())
+
+    d = per_row(p_a) - per_row(p_b)
+    mean, se = float(d.mean()), float(d.std() / len(d) ** 0.5)
+    return {"mean": mean, "se": se, "low": mean - 1.96 * se, "high": mean + 1.96 * se}
+
+
 def log(*parts: object) -> None:
     print(*parts, flush=True)
 
@@ -255,6 +268,7 @@ def main() -> None:
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(0)  # the model's initialization and batch order: reproducible results
     res: dict[str, object] = {
         "device": torch.cuda.get_device_name(0) if dev.type == "cuda" else "cpu"
     }
@@ -311,6 +325,12 @@ def main() -> None:
             lambda: IsotonicRegression(out_of_bounds="clip").fit(cal_np, cal_y_np)
         ),
         "torchisotonic_seconds": best_time(lambda: isotonic_fit(cal_s, cal_y)),
+        # The same with the scores and labels starting in host memory, as scikit-learn's do.
+        "torchisotonic_from_host_seconds": best_time(
+            lambda: isotonic_fit(
+                torch.from_numpy(cal_np).to(dev), torch.from_numpy(cal_y_np).to(dev)
+            )
+        ),
     }
     log("global isotonic:", res["global_isotonic"])
 
@@ -377,6 +397,14 @@ def main() -> None:
     res["day7_segments"] = {
         name: metrics(p[mt], test_y[mt]) for name, p in calibrated.items() if name != "none"
     }
+    # Is the per-segment gain over one curve more than noise? Paired over the same rows.
+    res["per_segment_gain"] = paired_logloss_gain(
+        calibrated["isotonic"][mt], calibrated["isotonic per segment"][mt], test_y[mt]
+    )
+    res["isotonic_over_platt_gain"] = paired_logloss_gain(
+        calibrated["Platt"], calibrated["isotonic"], test_y
+    )
+    log("log-loss gains:", res["per_segment_gain"], res["isotonic_over_platt_gain"])
 
     # 3. Isotonic calibration on growing numbers of scores (all days, for the timing only).
     all_d, all_c, all_y = to_dev(slice(0, n))
@@ -391,6 +419,11 @@ def main() -> None:
         row = {
             "scores": m,
             "torchisotonic_seconds": best_time(lambda s=s, y=y: isotonic_fit(s, y)),
+            "torchisotonic_from_host_seconds": best_time(
+                lambda sn=sn, yn=yn: isotonic_fit(
+                    torch.from_numpy(sn).to(dev), torch.from_numpy(yn).to(dev)
+                )
+            ),
             "sklearn_seconds": best_time(
                 lambda sn=sn, yn=yn: IsotonicRegression(out_of_bounds="clip").fit(sn, yn),
                 repeats=1,
@@ -420,23 +453,36 @@ def markdown(res: dict) -> str:
     lines += ["", title, "", "| calibration | log-loss | ECE |", "| --- | ---: | ---: |"]
     for name, m in res["day7_segments"].items():
         lines.append(f"| {name} | {m['logloss']:.4f} | {m['ece']:.4f} |")
+    gains = [
+        ("per_segment_gain", "per segment over one curve, on those rows"),
+        ("isotonic_over_platt_gain", "isotonic over Platt, on all of day 7"),
+    ]
+    for key, what in gains:
+        gain = res[key]
+        lines.append(
+            f"\nLog-loss gain, {what}: {gain['mean']:.2e} "
+            f"(95% interval {gain['low']:.2e} to {gain['high']:.2e})."
+        )
     g = res["global_isotonic"]
-    lines += ["", "| fit | rows | scikit-learn (CPU), s | torchisotonic, s | max difference |",
-              "| --- | ---: | ---: | ---: | ---: |"]  # fmt: skip
+    lines += ["", "| fit | rows | scikit-learn (CPU), s | torchisotonic, s | "
+              "from host memory, s | max difference |",
+              "| --- | ---: | ---: | ---: | ---: | ---: |"]  # fmt: skip
     lines.append(
         f"| one curve | {g['rows']:,} | {g['sklearn_seconds']:.3f} | "
-        f"{g['torchisotonic_seconds']:.4f} | {g['max_diff_vs_sklearn']:.1e} |"
+        f"{g['torchisotonic_seconds']:.4f} | {g['torchisotonic_from_host_seconds']:.4f} | "
+        f"{g['max_diff_vs_sklearn']:.1e} |"
     )
     lines.append(
         f"| {seg['segments']} curves | {seg['rows_in_segments']:,} | "
-        f"{seg['sklearn_seconds']:.3f} | {seg['torchisotonic_seconds']:.4f} | "
+        f"{seg['sklearn_seconds']:.3f} | {seg['torchisotonic_seconds']:.4f} | - | "
         f"{seg['max_diff_vs_sklearn']:.1e} |"
     )
-    lines += ["", "| scores | scikit-learn (CPU), s | torchisotonic, s |", "| ---: | ---: | ---: |"]
+    lines += ["", "| scores | scikit-learn (CPU), s | torchisotonic, s | from host memory, s |",
+              "| ---: | ---: | ---: | ---: |"]  # fmt: skip
     for row in res["scaling"]:
         lines.append(
             f"| {row['scores']:,} | {row['sklearn_seconds']:.3f} | "
-            f"{row['torchisotonic_seconds']:.4f} |"
+            f"{row['torchisotonic_seconds']:.4f} | {row['torchisotonic_from_host_seconds']:.4f} |"
         )
     return "\n".join(lines) + "\n"
 

@@ -121,6 +121,28 @@ def test_tiles_shapes(n: int, batch: int) -> None:  # pragma: no cover
     both(y.float(), tol=1e-4)
 
 
+@pytest.mark.parametrize("n", [100, 1000, 5000, 100_000])
+@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.usefixtures("tiles_only")
+def test_exact_flag(n: int, weighted: bool) -> None:  # pragma: no cover
+    # exact=True is the default; exact=False changes float32 only, and on ordinary data stays
+    # within float32's tolerance of the CPU.
+    g = torch.Generator().manual_seed(n)
+    y = torch.linspace(0, 3, n, dtype=torch.float64) + torch.randn(
+        8, n, generator=g, dtype=torch.float64
+    )
+    w = torch.rand(8, n, generator=g, dtype=torch.float64) + 0.1 if weighted else None
+    yc, wc = y.cuda(), None if w is None else w.cuda()
+    for dtype in (torch.float32, torch.float64):
+        wd = None if wc is None else wc.to(dtype)
+        default = torchisotonic.isotonic(yc.to(dtype), wd)
+        assert torch.equal(default, torchisotonic.isotonic(yc.to(dtype), wd, exact=True))
+        fast = torchisotonic.isotonic(yc.to(dtype), wd, exact=False)
+        if dtype == torch.float64:
+            assert torch.equal(fast, default)
+    both(y.float(), None if w is None else w.float(), tol=1e-4, exact=False)
+
+
 PATTERNS = ["increasing", "decreasing", "saw", "cliff", "walk", "constant", "valley"]
 
 

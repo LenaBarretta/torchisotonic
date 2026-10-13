@@ -29,6 +29,7 @@ def isotonic(
     y_min: float | None = None,
     y_max: float | None = None,
     dim: int = -1,
+    exact: bool = True,
 ) -> Tensor:
     """Isotonic regression of every 1-D slice of ``y`` along ``dim``.
 
@@ -43,6 +44,11 @@ def isotonic(
     elements, each the weighted mean of ``y`` over its block, so a gradient is averaged over
     the blocks (wherever the blocks do not change, that is everywhere but on a set of measure
     zero).
+
+    ``exact=False`` makes float32 on the GPU about twice as fast for short and medium rows,
+    at the cost of accuracy on hard inputs: with strongly varying weights, or increments near
+    float32's resolution, the fit may be off by up to about 1e-3 of the data's scale and pool
+    points that should stay apart. It has no effect on float64 or on the CPU.
     """
     if not isinstance(y, Tensor):
         raise TypeError(f"y must be a torch.Tensor, got {type(y).__name__}")
@@ -68,7 +74,7 @@ def isotonic(
         return y.to(out_dtype, copy=True)
     flat_y = rows.reshape(-1, shape[-1]).to(acc)
     flat_w = None if w is None else w.reshape(-1, shape[-1])
-    out: Tensor = _Isotonic.apply(flat_y, flat_w, increasing)
+    out: Tensor = _Isotonic.apply(flat_y, flat_w, increasing, exact)
     if y_min is not None or y_max is not None:
         out = out.clamp(min=y_min, max=y_max)
     return out.reshape(shape).movedim(-1, dim).to(out_dtype)
@@ -78,24 +84,26 @@ class _Isotonic(torch.autograd.Function):
     """_solve, with the gradient of the fit: averaging over its blocks."""
 
     @staticmethod
-    def forward(ctx: Any, flat_y: Tensor, flat_w: Tensor | None, increasing: bool) -> Tensor:
-        out = _solve(flat_y, flat_w, increasing)
+    def forward(
+        ctx: Any, flat_y: Tensor, flat_w: Tensor | None, increasing: bool, exact: bool
+    ) -> Tensor:
+        out = _solve(flat_y, flat_w, increasing, exact)
         ctx.save_for_backward(flat_y, flat_w, out)
         return out
 
     @staticmethod
-    def backward(ctx: Any, grad: Tensor) -> tuple[Tensor | None, Tensor | None, None]:
+    def backward(ctx: Any, grad: Tensor) -> tuple[Tensor | None, Tensor | None, None, None]:
         flat_y, flat_w, out = ctx.saved_tensors
         want_w = ctx.needs_input_grad[1]
         if out.is_cuda and CUDA_METHOD == "tiles":  # pragma: no cover - needs a GPU
             gy, gw = _ext.isotonic_grad(out, grad, flat_w, flat_y if want_w else None)
-            return gy if ctx.needs_input_grad[0] else None, gw if want_w else None, None
+            return gy if ctx.needs_input_grad[0] else None, gw if want_w else None, None, None
         w = torch.ones_like(out) if flat_w is None else flat_w
         g_sum, w_sum = _block_sums(out, grad, w)
         mean_grad = g_sum / w_sum  # d(loss) / d(block's mean), per unit of weight
         grad_y = w * mean_grad if ctx.needs_input_grad[0] else None
         grad_w = (flat_y - out) * mean_grad if want_w else None
-        return grad_y, grad_w, None
+        return grad_y, grad_w, None, None
 
 
 def _block_sums(out: Tensor, *values: Tensor) -> list[Tensor]:
@@ -122,13 +130,13 @@ def _block_sums(out: Tensor, *values: Tensor) -> list[Tensor]:
     return sums
 
 
-def _solve(flat_y: Tensor, flat_w: Tensor | None, increasing: bool) -> Tensor:
+def _solve(flat_y: Tensor, flat_w: Tensor | None, increasing: bool, exact: bool = True) -> Tensor:
     """The fit of [batch, n] problems (n >= 1), in flat_y's dtype."""
     if (
         flat_y.is_cuda and CUDA_METHOD == "tiles" and flat_y.shape[1] >= TILES_MIN_N
     ):  # pragma: no cover - needs a GPU
         return _ext.isotonic_tiles(
-            flat_y.contiguous(), None if flat_w is None else flat_w.contiguous(), increasing
+            flat_y.contiguous(), None if flat_w is None else flat_w.contiguous(), increasing, exact
         )
     w = torch.ones_like(flat_y) if flat_w is None else flat_w
     y = flat_y if increasing else -flat_y  # a decreasing fit of y is minus the increasing fit of -y

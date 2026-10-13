@@ -141,7 +141,7 @@ at::Tensor isotonic_hull_cpu(
 TORCH_LIBRARY(torchisotonic, m) {
   m.def("isotonic(Tensor y, Tensor w) -> Tensor");
   m.def("isotonic_hull(Tensor y, Tensor w, Tensor centre, int chunk) -> Tensor");
-  m.def("isotonic_tiles(Tensor y, Tensor? w, bool increasing) -> Tensor");
+  m.def("isotonic_tiles(Tensor y, Tensor? w, bool increasing, bool exact=True) -> Tensor");
   m.def("isotonic_grad(Tensor out, Tensor g, Tensor? w, Tensor? y) -> Tensor[]");
 }
 

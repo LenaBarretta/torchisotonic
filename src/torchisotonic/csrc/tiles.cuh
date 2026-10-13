@@ -105,7 +105,10 @@ __device__ __forceinline__ int imax(int a, int b) {
 // ---------------------------------------------------------------------------------------------
 // Chunk level: one block of WARPS warps; 32 elements per lane, 1024 per warp.
 
-template <typename acc_t, bool WEIGHTED, int WARPS>
+// EXACT (the default; see isotonic_tiles_cuda): the float32 sums within a lane are pairs and
+// the chunk level's turns are filtered. Without it, float32 runs about twice as fast, with
+// errors up to about 1e-3 of the data's scale on hard, weighted data. Float64 ignores it.
+template <typename acc_t, bool WEIGHTED, int WARPS, bool EXACT = true>
 struct Chunk {
   using acc = acc_t;
   static constexpr bool kW = WEIGHTED;
@@ -115,7 +118,8 @@ struct Chunk {
   // be far larger than a single term, and the float32 rounding of the sum would decide which
   // points are vertices. The lo part is stored as a 16-bit code (pack_lo), half the shared
   // memory of a float. In float64 the hi part alone is accurate enough.
-  static constexpr bool kPairs = sizeof(acc_t) == 4;
+  static constexpr bool kExact = EXACT || sizeof(acc_t) == 8;
+  static constexpr bool kPairs = EXACT && sizeof(acc_t) == 4;
   acc_t sy[kN + kL];                         // lane-local cumulative sums of w * y, by element
   acc_t sx[WEIGHTED ? kN + kL : 1];          // ... and of w
   int16_t syl[kPairs ? kN + kL : 1];         // their lo parts, packed (float32 only)
@@ -131,9 +135,11 @@ struct Chunk {
 };
 
 // The largest block (in warps, at most 4) whose shared memory fits the 48 KB of a launch.
-template <typename T, bool W>
+template <typename T, bool W, bool EXACT = true>
 constexpr int chunk_warps() {
-  return sizeof(Chunk<T, W, 4>) <= 48 * 1024 ? 4 : sizeof(Chunk<T, W, 2>) <= 48 * 1024 ? 2 : 1;
+  return sizeof(Chunk<T, W, 4, EXACT>) <= 48 * 1024   ? 4
+         : sizeof(Chunk<T, W, 2, EXACT>) <= 48 * 1024 ? 2
+                                                      : 1;
 }
 
 // v (0 <= v < 2^23) as a float without I2F, which issues at a quarter of the rate of a float
@@ -430,9 +436,23 @@ __device__ __noinline__ acc_t turn2_slow(
 }
 
 // > 0 when a, b, d turn left (counter-clockwise).
-template <bool W, typename acc_t>
+// FILTER: decide from the hi parts when that is safe, from the pairs otherwise; without it,
+// from the hi and lo differences added (as EXACT = false asks).
+template <bool W, bool FILTER = true, typename acc_t>
 __device__ __forceinline__ acc_t turn2(
     const Point2<acc_t>& a, const Point2<acc_t>& b, const Point2<acc_t>& d) {
+  if constexpr (!FILTER) {
+    const acc_t y1 = (b.yh - a.yh) + (b.yl - a.yl), y2 = (d.yh - a.yh) + (d.yl - a.yl);
+    acc_t x1, x2;
+    if (W) {
+      x1 = (b.xh - a.xh) + (b.xl - a.xl);
+      x2 = (d.xh - a.xh) + (d.xl - a.xl);
+    } else {
+      x1 = to_acc<acc_t>(b.p - a.p);
+      x2 = to_acc<acc_t>(d.p - a.p);
+    }
+    return x1 * y2 - y1 * x2;
+  }
   const acc_t y1 = b.yh - a.yh, y2 = d.yh - a.yh;
   acc_t x1, x2;
   if (W) {
@@ -470,7 +490,7 @@ __device__ int walk_bridge(
   using acc_t = typename C::acc;
   int a = prev_vertex(c, shared), b = next_vertex(c, shared, t1, end);
   Point2<acc_t> pa = load(a), pb = load(b);
-  if (turn2<C::kW>(pa, load(shared), pb) > 0) {
+  if (turn2<C::kW, C::kExact>(pa, load(shared), pb) > 0) {
     *a_out = -1;  // convex at the shared point
     return 0;
   }
@@ -482,7 +502,7 @@ __device__ int walk_bridge(
       const int nb = next_vertex(c, b, t1, end);
       const Point2<acc_t> q = load(nb);
       ++steps;
-      if (turn2<C::kW>(pa, pb, q) > 0) {
+      if (turn2<C::kW, C::kExact>(pa, pb, q) > 0) {
         break;
       }
       b = nb;
@@ -493,7 +513,7 @@ __device__ int walk_bridge(
       const int na = prev_vertex(c, a);
       const Point2<acc_t> q = load(na);
       ++steps;
-      if (turn2<C::kW>(q, pa, pb) > 0) {
+      if (turn2<C::kW, C::kExact>(q, pa, pb) > 0) {
         break;
       }
       a = na;
@@ -659,7 +679,7 @@ struct Hulls {  // the chunks' hulls (vertices in their chunk's coordinates) and
   const double* cx_lo;
 };
 
-template <typename scalar_t, bool W, int WARPS>
+template <typename scalar_t, bool W, int WARPS, bool EXACT = true>
 __global__ void __launch_bounds__(WARPS * kLanes) chunk_kernel(
     const scalar_t* __restrict__ y,
     const scalar_t* __restrict__ w,
@@ -669,7 +689,7 @@ __global__ void __launch_bounds__(WARPS * kLanes) chunk_kernel(
     scalar_t* __restrict__ out,
     Hulls h) {
   using acc_t = scalar_t;
-  using C = Chunk<acc_t, W, WARPS>;
+  using C = Chunk<acc_t, W, WARPS, EXACT>;
   constexpr int kL = C::kL, kN = C::kN;
   __shared__ C c;
   const int t = threadIdx.x, lane = t % kLanes, warp = t / kLanes;  // t: this thread's lane
@@ -939,7 +959,7 @@ __global__ void __launch_bounds__(WARPS * kLanes) chunk_kernel(
 // of a problem; everything else is chunk_kernel's, done per problem. A point other than its
 // problem's start is taken as the one after the element before it: so the end of a problem
 // is the end of its last element, though it may share its index with the next one's start.
-template <typename scalar_t, bool W, int WARPS>
+template <typename scalar_t, bool W, int WARPS, bool EXACT = true>
 __global__ void __launch_bounds__(WARPS * kLanes) packed_kernel(
     const scalar_t* __restrict__ y,
     const scalar_t* __restrict__ w,
@@ -950,7 +970,7 @@ __global__ void __launch_bounds__(WARPS * kLanes) packed_kernel(
     scalar_t sign,
     scalar_t* __restrict__ out) {
   using acc_t = scalar_t;
-  using C = Chunk<acc_t, W, 1>;
+  using C = Chunk<acc_t, W, 1, EXACT>;
   __shared__ C shared[WARPS];
   __shared__ int bad[WARPS][kLanes];  // per problem of the warp: whether it holds a NaN
   const int lane = threadIdx.x % kLanes, warp = threadIdx.x / kLanes;
@@ -1886,33 +1906,33 @@ void run_chunks(
   run_chunks<scalar_t, W, chunk>(y, w, increasing, out, launch, merge_rounds<W>);
 }
 
-template <typename scalar_t, bool W, int warps>
+template <typename scalar_t, bool W, int warps, bool EXACT>
 void run(const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out) {
   const scalar_t* yp = y.data_ptr<scalar_t>();
   const scalar_t* wp = W ? w->data_ptr<scalar_t>() : nullptr;
-  run_chunks<scalar_t, W, Chunk<scalar_t, W, warps>::kN>(
+  run_chunks<scalar_t, W, Chunk<scalar_t, W, warps, EXACT>::kN>(
       y, w, increasing, out,
       [&](int64_t chunks, int64_t n, int64_t per_row, scalar_t sign, scalar_t* o, Hulls h,
           cudaStream_t stream) {
         // The largest shared memory carveout: shared memory limits the blocks per SM.
         static const bool carved = [] {
-          C10_CUDA_CHECK(cudaFuncSetAttribute(chunk_kernel<scalar_t, W, warps>,
+          C10_CUDA_CHECK(cudaFuncSetAttribute(chunk_kernel<scalar_t, W, warps, EXACT>,
                                               cudaFuncAttributePreferredSharedMemoryCarveout,
                                               cudaSharedmemCarveoutMaxShared));
           return true;
         }();
         (void)carved;
-        chunk_kernel<scalar_t, W, warps><<<chunks, warps * kLanes, 0, stream>>>(
+        chunk_kernel<scalar_t, W, warps, EXACT><<<chunks, warps * kLanes, 0, stream>>>(
             yp, wp, n, per_row, sign, o, h);
       });
 }
 
 // Problems of up to 512 elements, several per warp (packed_kernel).
-template <typename scalar_t, bool W>
+template <typename scalar_t, bool W, bool EXACT>
 void run_packed(const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out) {
   // Warps per block, each on its own problems: up to 4, as shared memory allows.
-  constexpr int per_warp_shared =
-      static_cast<int>(sizeof(Chunk<scalar_t, W, 1>)) + kLanes * static_cast<int>(sizeof(int));
+  constexpr int per_warp_shared = static_cast<int>(sizeof(Chunk<scalar_t, W, 1, EXACT>)) +
+                                  kLanes * static_cast<int>(sizeof(int));
   constexpr int warps = 48 * 1024 / per_warp_shared >= 4   ? 4
                         : 48 * 1024 / per_warp_shared >= 2 ? 2
                                                            : 1;
@@ -1924,7 +1944,7 @@ void run_packed(const at::Tensor& y, const at::Tensor* w, bool increasing, at::T
   }
   const int64_t per_warp = kLanes / L, groups = (batch + per_warp - 1) / per_warp;
   const unsigned long long inv_n = ((1ULL << 32) + n - 1) / n;
-  packed_kernel<scalar_t, W, warps>
+  packed_kernel<scalar_t, W, warps, EXACT>
       <<<(groups + warps - 1) / warps, warps * kLanes, 0, at::cuda::getCurrentCUDAStream()>>>(
           y.data_ptr<scalar_t>(), W ? w->data_ptr<scalar_t>() : nullptr, batch, n, L, inv_n,
           increasing ? scalar_t(1) : scalar_t(-1), out.data_ptr<scalar_t>());
@@ -1934,12 +1954,12 @@ void run_packed(const at::Tensor& y, const at::Tensor* w, bool increasing, at::T
 // The chunk size, tuned on a T4: a problem of up to 4096 elements is one chunk of as few warps
 // as cover it (finished in one kernel, no warp idle); longer ones are split into one-warp
 // chunks, whose hulls cost least to build. TI_CHUNK_WARPS (1, 2 or 4) overrides it.
-template <typename scalar_t, bool W>
+template <typename scalar_t, bool W, bool EXACT>
 void run_sized(const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out) {
-  constexpr int most = chunk_warps<scalar_t, W>();
+  constexpr int most = chunk_warps<scalar_t, W, EXACT>();
   const int64_t n = y.size(1);
   if (n <= 512 && !std::getenv("TI_CHUNK_WARPS")) {  // several problems per warp
-    run_packed<scalar_t, W>(y, w, increasing, out);
+    run_packed<scalar_t, W, EXACT>(y, w, increasing, out);
     return;
   }
   int warps = n <= 1024 ? 1 : n <= 2048 ? 2 : n <= 4096 ? 4 : 1;
@@ -1947,16 +1967,17 @@ void run_sized(const at::Tensor& y, const at::Tensor* w, bool increasing, at::Te
     warps = std::atoi(forced);
   }
   if (warps >= 4 && most >= 4) {
-    run<scalar_t, W, (most >= 4 ? 4 : 1)>(y, w, increasing, out);
+    run<scalar_t, W, (most >= 4 ? 4 : 1), EXACT>(y, w, increasing, out);
   } else if (warps >= 2 && most >= 2) {
-    run<scalar_t, W, (most >= 2 ? 2 : 1)>(y, w, increasing, out);
+    run<scalar_t, W, (most >= 2 ? 2 : 1), EXACT>(y, w, increasing, out);
   } else {
-    run<scalar_t, W, 1>(y, w, increasing, out);
+    run<scalar_t, W, 1, EXACT>(y, w, increasing, out);
   }
 }
 
+// exact = false: float32 without the pairs within lanes (see Chunk); float64 is unaffected.
 at::Tensor isotonic_tiles_cuda(
-    const at::Tensor& y, const c10::optional<at::Tensor>& w, bool increasing) {
+    const at::Tensor& y, const c10::optional<at::Tensor>& w, bool increasing, bool exact = true) {
   TORCH_CHECK(y.dim() == 2 && y.size(1) >= 1, "y must be [batch, n] with n >= 1");
   TORCH_CHECK(y.is_contiguous(), "y must be contiguous");
   const bool weighted = w.has_value();
@@ -1969,10 +1990,21 @@ at::Tensor isotonic_tiles_cuda(
   const c10::cuda::CUDAGuard guard(y.device());
   at::Tensor out = at::empty_like(y);
   AT_DISPATCH_FLOATING_TYPES(y.scalar_type(), "isotonic_tiles_cuda", [&] {
+    // Only float32 has a separate fast path, so only it is compiled twice.
+    if constexpr (sizeof(scalar_t) == 4) {
+      if (!exact) {
+        if (weighted) {
+          run_sized<scalar_t, true, false>(y, &*w, increasing, out);
+        } else {
+          run_sized<scalar_t, false, false>(y, nullptr, increasing, out);
+        }
+        return;
+      }
+    }
     if (weighted) {
-      run_sized<scalar_t, true>(y, &*w, increasing, out);
+      run_sized<scalar_t, true, true>(y, &*w, increasing, out);
     } else {
-      run_sized<scalar_t, false>(y, nullptr, increasing, out);
+      run_sized<scalar_t, false, true>(y, nullptr, increasing, out);
     }
   });
   return out;

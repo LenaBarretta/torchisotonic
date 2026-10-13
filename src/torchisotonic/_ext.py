@@ -29,9 +29,11 @@ def isotonic_hull(y: Tensor, w: Tensor, centre: Tensor, chunk: int) -> Tensor:
     return out
 
 
-def isotonic_tiles(y: Tensor, w: Tensor | None, increasing: bool) -> Tensor:  # pragma: no cover
+def isotonic_tiles(
+    y: Tensor, w: Tensor | None, increasing: bool, exact: bool = True
+) -> Tensor:  # pragma: no cover
     """The fit of every row of ``y`` ([batch, n], CUDA) by the tile pipeline, in y's dtype."""
-    out: Tensor = _load().isotonic_tiles(y, w, increasing)
+    out: Tensor = _load().isotonic_tiles(y, w, increasing, exact)
     return out
 
 

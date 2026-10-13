@@ -66,6 +66,9 @@ def impls(data: np.ndarray, cuda: bool, gpu_only: bool = False) -> dict[str, Fn]
     if cuda:
         x = torch.tensor(data, device="cuda")
         out["torchisotonic (cuda)"] = lambda: torchisotonic.isotonic(x, increasing=False)
+        out["torchisotonic (cuda, exact=False)"] = lambda: torchisotonic.isotonic(
+            x, increasing=False, exact=False
+        )
     cpu = torch.tensor(data)
     if not gpu_only:
         out["torchisotonic (cpu)"] = lambda: torchisotonic.isotonic(cpu, increasing=False)
