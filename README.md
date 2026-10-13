@@ -74,7 +74,7 @@ data (the "greatest convex minorant"), so the GPU code builds that hull in paral
 3. Every element takes the slope of the hull edge above it.
 
 [`docs/hull_prototype.py`](docs/hull_prototype.py) is a plain-numpy reference of the parallel
-algorithm; [`src/torchisotonic/csrc/ops_tiles.cu`](src/torchisotonic/csrc/ops_tiles.cu)
+algorithm; [`src/torchisotonic/csrc/tiles.cuh`](src/torchisotonic/csrc/tiles.cuh)
 describes the kernels. On the CPU, rows are solved with PAVA, in parallel.
 
 ## Development

@@ -10,19 +10,49 @@ namespace tiexp_plain_stack {
 using namespace torchisotonic;
 
 template <bool W, typename acc_t>
-__device__ uint32_t plain_chain(const acc_t* sy, const acc_t* sx, int count) {
+__device__ __noinline__ acc_t plain_turn_slow(
+    acc_t ax, acc_t ay, acc_t axl, acc_t ayl, acc_t bx, acc_t by, acc_t bxl, acc_t byl, acc_t qx,
+    acc_t qy, acc_t qxl, acc_t qyl, acc_t dx1, acc_t dx2) {
+  const Pair<acc_t> py1 = diff2(by, byl, ay, ayl), py2 = diff2(qy, qyl, ay, ayl);
+  const Pair<acc_t> px1 = W ? diff2(bx, bxl, ax, axl) : Pair<acc_t>{dx1, acc_t(0)};
+  const Pair<acc_t> px2 = W ? diff2(qx, qxl, ax, axl) : Pair<acc_t>{dx2, acc_t(0)};
+  return cross2(px1, py1, px2, py2);
+}
+
+// PAIRS as in lane_chain: the sums come as hi + lo and the predicate uses both parts.
+template <bool W, bool PAIRS, typename acc_t>
+__device__ uint32_t plain_chain(
+    const acc_t* sy, const int16_t* syl, const acc_t* sx, const int16_t* sxl, int count,
+    acc_t by_, acc_t bx_) {
   int si[kLanes + 1];
-  acc_t stx[kLanes + 1], sty[kLanes + 1];
+  acc_t stx[kLanes + 1], sty[kLanes + 1], stxl[kLanes + 1], styl[kLanes + 1];
   int h = 0;
   si[h] = 0;
   stx[h] = 0;
   sty[h] = 0;
+  stxl[h] = 0;
+  styl[h] = 0;
   ++h;
   for (int k = 1; k <= count; ++k) {
     const acc_t qx = W ? sx[k - 1] : acc_t(k), qy = sy[k - 1];
+    const acc_t qxl = W && PAIRS ? unpack_lo(qx, sxl[k - 1]) : acc_t(0);
+    const acc_t qyl = PAIRS ? unpack_lo(qy, syl[k - 1]) : acc_t(0);
     while (h >= 2) {
       const acc_t ax = stx[h - 2], ay = sty[h - 2], bx = stx[h - 1], by = sty[h - 1];
-      if ((bx - ax) * (qy - ay) - (by - ay) * (qx - ax) > 0) {
+      const acc_t axl = stxl[h - 2], ayl = styl[h - 2], bxl = stxl[h - 1], byl = styl[h - 1];
+      const acc_t dx1 = bx - ax, dy1 = by - ay, dx2 = qx - ax, dy2 = qy - ay;
+      const acc_t p1 = dx1 * dy2, p2 = dy1 * dx2;
+      acc_t c = p1 - p2;
+      if constexpr (PAIRS) {  // the package's filter and pair fallback (lane_chain)
+        acc_t bound = fma(by_, fabs(dx1) + fabs(dx2), bound_p<acc_t>() * (fabs(p1) + fabs(p2)));
+        if (W) {
+          bound = fma(bx_, fabs(dy1) + fabs(dy2), bound);
+        }
+        if (!(fabs(c) > bound)) {
+          c = plain_turn_slow<W>(ax, ay, axl, ayl, bx, by, bxl, byl, qx, qy, qxl, qyl, dx1, dx2);
+        }
+      }
+      if (c > 0) {
         break;
       }
       --h;
@@ -30,6 +60,8 @@ __device__ uint32_t plain_chain(const acc_t* sy, const acc_t* sx, int count) {
     si[h] = k;
     stx[h] = qx;
     sty[h] = qy;
+    stxl[h] = qxl;
+    styl[h] = qyl;
     ++h;
   }
   uint32_t mask = 0;
@@ -96,7 +128,7 @@ __global__ void __launch_bounds__(WARPS * kLanes) ablate_kernel(
   // short (the kernel is bound by instructions issued, not by latency).
   const int count = imax(0, imin(kLanes, len - t * kLanes));
   uint32_t mask = count > 0 ? 1u : 0u;
-  acc_t tx = 0, ty = 0;
+  acc_t tx = 0, ty = 0, txl = 0, tyl = 0, my = 0, mx = 0;
   {
     const int base = t * (kLanes + 1);
     acc_t py[kLanes], px[W ? kLanes : 1];
@@ -109,25 +141,36 @@ __global__ void __launch_bounds__(WARPS * kLanes) ablate_kernel(
     }
 #pragma unroll
     for (int k = 0; k < kLanes; ++k) {  // py[k]: point k + 1
-      ty += k < count ? py[k] : acc_t(0);
+      scan_step<C::kPairs>(ty, tyl, k < count ? py[k] : acc_t(0));
       c.sy[base + k] = ty;
+      my = fmax(my, fabs(ty));
+      if (C::kPairs) {
+        c.syl[base + k] = pack_lo(ty, tyl);
+      }
       if (W) {
-        tx += k < count ? px[k] : acc_t(0);
+        scan_step<C::kPairs>(tx, txl, k < count ? px[k] : acc_t(0));
         c.sx[base + k] = tx;
+        mx = fmax(mx, fabs(tx));
+        if (C::kPairs) {
+          c.sxl[base + k] = pack_lo(tx, txl);
+        }
       }
     }
     if (!W) {
       tx = acc_t(count);
     }
-    mask = plain_chain<W>(c.sy + base, c.sx + (W ? base : 0), count);
+    mask = plain_chain<W, C::kPairs>(c.sy + base, c.syl + (C::kPairs ? base : 0),
+                                     c.sx + (W ? base : 0),
+                                     c.sxl + (W && C::kPairs ? base : 0), count,
+                                     bound_m<acc_t>() * my, bound_m<acc_t>() * mx);
   }
 
   TI_MARK(1);
   TI_STOP(1, static_cast<int>(mask) ^ __float_as_int(static_cast<float>(ty)));
-  const double iy = lane_starts<acc_t, WARPS>(ty, lane, warp, c.by, c.wy);
+  const double iy = lane_starts<acc_t, WARPS>(ty, tyl, lane, warp, c.by, c.wy);
   double ix = 0.0;
   if constexpr (W) {
-    ix = lane_starts<acc_t, WARPS>(tx, lane, warp, c.bx, c.wx);
+    ix = lane_starts<acc_t, WARPS>(tx, txl, lane, warp, c.bx, c.wx);
   }
 
   TI_MARK(2);
@@ -250,14 +293,15 @@ __global__ void __launch_bounds__(WARPS * kLanes) ablate_kernel(
       for (int k = kLanes - 1; k >= 0; --k) {
         if ((mask >> k) & 1u) {
           const Local<acc_t> pa = local(c, p0 + k);
-          acc_t dx, dy;
+          Pair<acc_t> dx, dy;
           if (nv / kLanes == t) {  // both ends in this lane: no lane starts involved
-            dy = pn.y - pa.y;
-            dx = W ? pn.x - pa.x : to_acc<acc_t>(nv - p0 - k);
+            dy = diff2(pn.y, pn.yl, pa.y, pa.yl);
+            dx = W ? diff2(pn.x, pn.xl, pa.x, pa.xl)
+                   : Pair<acc_t>{to_acc<acc_t>(nv - p0 - k), acc_t(0)};
           } else {
             delta(c, pa, pn, dx, dy);
           }
-          slope[k] = sign * (dy / dx);
+          slope[k] = sign * ((dy.h + dy.l) / (dx.h + dx.l));
           if (!found) {
             last = slope[k];
             found = true;
@@ -318,10 +362,10 @@ __global__ void __launch_bounds__(WARPS * kLanes) ablate_kernel(
     const int u = p / kLanes;
     h.p[voff + i] = static_cast<int32_t>(j * kN + p);
     h.y[voff + i] = static_cast<double>(c.by[0][u]) + static_cast<double>(c.by[1][u]) +
-                    static_cast<double>(q.y);
+                    static_cast<double>(q.y) + static_cast<double>(q.yl);
     if (W) {
       h.x[voff + i] = static_cast<double>(c.bx[0][u]) + static_cast<double>(c.bx[1][u]) +
-                      static_cast<double>(q.x);
+                      static_cast<double>(q.x) + static_cast<double>(q.xl);
     }
   };
   {

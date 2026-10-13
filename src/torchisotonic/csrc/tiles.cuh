@@ -1,5 +1,5 @@
-// The CUDA pipeline behind torchisotonic::isotonic_tiles (registered in ops_tiles.cu), as a
-// header so that experiments/ can build variants of it next to it.
+// The CUDA pipeline behind torchisotonic::isotonic_tiles (registered in ops_tiles.cu). It is a
+// header so that the variants in experiments/ can reuse the parts they do not change.
 //
 // The fit is the slope of the lower convex hull of the cumulative sum diagram (hull.h). Every
 // element is read once, by one thread; after that only hull vertices travel:
@@ -12,24 +12,23 @@
 //    the mask bits under it, nothing is copied. A problem that fits in one chunk is finished
 //    right there: the block writes its fit. Otherwise it writes the chunk's hull vertices and
 //    sums.
-// 2. Prefix sums over the chunks' sums place every chunk in its problem.
-// 3. merge_kernel: neighbouring chunk hulls merge pairwise, one warp per pair, log2(chunks)
-//    rounds. A hull is a list of segments - ranges of vertices of the chunks' hulls - so a
-//    merge shortens two segments and moves the list's tail: it costs segments, not vertices.
-//    (One kernel launch per round: tried as a single kernel where a merge starts once both of
-//    its halves are done, it was slower - a warp per merge, and reads past L1. Also tried, and
-//    slower on noisy data: dropping lane hull vertices above chords between extreme points
-//    before the lane merges - it removed only a quarter of the walks' work.)
+// 2. chunk_starts_kernel: prefix sums over the chunks' sums place every chunk in its problem.
+// 3. merge_kernel: neighbouring chunk hulls merge pairwise, log2(chunks) rounds, one launch
+//    per round: a thread per merge while there are many (it walks to the bridge, and searches
+//    for it if the walk is long), a warp per merge in the last rounds. A hull is a list of
+//    segments - ranges of vertices of the chunks' hulls - so a merge shortens two segments and
+//    moves the list's tail: it costs segments, not vertices.
 // 4. ends_kernel / fit_kernel: every chunk learns which of its vertices survive and the slopes
 //    of the bridges into and out of it; then every element takes the slope of its edge.
 //
 // Problems of up to 512 elements are packed several per warp instead (packed_kernel) and
 // finished in one kernel.
 //
-// Coordinates: a lane's points are relative to the lane's start; lane starts are relative to
-// the chunk's start, as hi + lo pairs of the working precision, so that a difference of two
-// points keeps the precision of the difference rather than of the chunk's sums; chunk starts
-// are double.
+// Coordinates are relative, so that the difference of two nearby points keeps the precision
+// of the difference rather than that of the sums: a lane's points are relative to the lane's
+// start, lane starts to the chunk's start, chunk starts to the problem's start. Lane starts
+// and chunk starts are hi + lo pairs (of the working type and of double); in float32 the sums
+// within a lane are pairs too.
 #pragma once
 
 #include <ATen/ATen.h>
@@ -60,13 +59,13 @@ __device__ unsigned long long phase_cycles[8];
 constexpr int kStatRounds = 32;
 __device__ unsigned long long merge_level_stats[kStatRounds][3];
 __device__ unsigned long long merge_counts[2];
-#define TI_MARK(i)                                              \
-  do {                                                          \
-    if (lane == 0) {                                            \
-      const long long now = clock64();                          \
+#define TI_MARK(i)                                                          \
+  do {                                                                      \
+    if (lane == 0) {                                                        \
+      const long long now = clock64();                                      \
       atomicAdd(&phase_cycles[i], static_cast<unsigned long long>(now - mark)); \
-      mark = now;                                               \
-    }                                                           \
+      mark = now;                                                           \
+    }                                                                       \
   } while (0)
 // ...and with phase_stop = i, returns right after phase i: timing the kernel cut at every
 // phase gives each phase's real share (the write that depends on `keep` never happens, it
@@ -112,8 +111,15 @@ struct Chunk {
   static constexpr bool kW = WEIGHTED;
   static constexpr int kL = WARPS * kLanes;  // lanes
   static constexpr int kN = kL * kLanes;     // elements
+  // In float32 a lane's sums are pairs hi + lo: with weighted data the sums of 32 terms can
+  // be far larger than a single term, and the float32 rounding of the sum would decide which
+  // points are vertices. The lo part is stored as a 16-bit code (pack_lo), half the shared
+  // memory of a float. In float64 the hi part alone is accurate enough.
+  static constexpr bool kPairs = sizeof(acc_t) == 4;
   acc_t sy[kN + kL];                         // lane-local cumulative sums of w * y, by element
   acc_t sx[WEIGHTED ? kN + kL : 1];          // ... and of w
+  int16_t syl[kPairs ? kN + kL : 1];         // their lo parts, packed (float32 only)
+  int16_t sxl[kPairs && WEIGHTED ? kN + kL : 1];
   acc_t by[2][kL + 1];                       // lane starts, hi and lo; [kL] is the chunk end
   acc_t bx[2][WEIGHTED ? kL + 1 : 1];
   uint32_t mask[kL + 1];                     // each lane's points that are still vertices
@@ -130,8 +136,8 @@ constexpr int chunk_warps() {
   return sizeof(Chunk<T, W, 4>) <= 48 * 1024 ? 4 : sizeof(Chunk<T, W, 2>) <= 48 * 1024 ? 2 : 1;
 }
 
-// v (0 <= v < 2^23) as a float without I2F, which on this hardware issues at a quarter of
-// the rate of a float add: the bits of 2^23 + v, minus 2^23.
+// v (0 <= v < 2^23) as a float without I2F, which issues at a quarter of the rate of a float
+// add: the bits of 2^23 + v, minus 2^23.
 __device__ __forceinline__ float small_float(int v, float) {
   return __int_as_float(v | 0x4B000000) - 8388608.0f;
 }
@@ -142,49 +148,6 @@ __device__ __forceinline__ double small_float(int v, double) {
 template <typename acc_t>
 __device__ __forceinline__ acc_t to_acc(int v) {
   return small_float(v, acc_t(0));
-}
-
-template <typename acc_t>
-struct Local {  // a point of the chunk: its index, and coordinates from its lane's start
-  int p;
-  acc_t x, y;  // x: weighted only (otherwise the point index is the coordinate)
-};
-
-// Point p of the chunk (p = after its first p elements; the chunk's end has p = its length).
-template <typename C>
-__device__ __forceinline__ Local<typename C::acc> local(const C& c, int p) {
-  Local<typename C::acc> q{p, 0, 0};
-  if (p & (kLanes - 1)) {
-    q.y = c.sy[pad(p - 1)];
-    if (C::kW) {
-      q.x = c.sx[pad(p - 1)];
-    }
-  }
-  return q;
-}
-
-// b - a in chunk coordinates (b right of a).
-template <typename C, typename acc_t>
-__device__ __forceinline__ void delta(
-    const C& c, const Local<acc_t>& a, const Local<acc_t>& b, acc_t& dx, acc_t& dy) {
-  const int la = a.p / kLanes, lb = b.p / kLanes;
-  dy = (c.by[0][lb] - c.by[0][la]) + (c.by[1][lb] - c.by[1][la]) + (b.y - a.y);
-  if (C::kW) {
-    dx = (c.bx[0][lb] - c.bx[0][la]) + (c.bx[1][lb] - c.bx[1][la]) + (b.x - a.x);
-  } else {
-    dx = to_acc<acc_t>(b.p - a.p);
-  }
-}
-
-template <typename T>
-__device__ __forceinline__ T warp_inclusive_sum(T v, int lane) {
-  for (int d = 1; d < kLanes; d <<= 1) {
-    const T o = __shfl_up_sync(kFull, v, d);
-    if (lane >= d) {
-      v += o;
-    }
-  }
-  return v;
 }
 
 // s + e == a + b exactly (Knuth's two-sum).
@@ -205,11 +168,151 @@ __device__ __forceinline__ void add2(T& h, T& l, T bh, T bl) {
   l = e - (h - s);
 }
 
-// Inclusive prefix sums over the warp of v, as hi + lo.
+// The lo part of a float pair as a 16-bit code: lo / 2^E in units of 2^-38, E the exponent
+// of hi (|lo| <= ulp(hi) / 2 = 2^(E - 24) after a renormalized two-sum, so the code is within
+// +-2^14). Sums below 2^-89 in magnitude keep no lo part: it would be below 2^-113.
+__device__ __forceinline__ int16_t pack_lo(float hi, float lo) {
+  const int e = (__float_as_int(hi) >> 23) & 0xff;  // biased exponent of hi
+  if (e <= 38) {
+    return 0;
+  }
+  const float scale = __int_as_float((292 - e) << 23);  // 2^(38 - E)
+  return static_cast<int16_t>(__float2int_rn(lo * scale));
+}
+// Float64 sums keep no lo parts (Chunk::kPairs): these only make the templates compile.
+__device__ __forceinline__ int16_t pack_lo(double, double) {
+  return 0;
+}
+
+__device__ __forceinline__ float unpack_lo(float hi, int16_t code) {
+  const int e = (__float_as_int(hi) >> 23) & 0xff;
+  return e <= 38 ? 0.0f : static_cast<float>(code) * __int_as_float((e - 38) << 23);
+}
+__device__ __forceinline__ double unpack_lo(double, int16_t) {
+  return 0.0;
+}
+
+// An unevaluated sum h + l. The chunk level's turn predicates work on the hi parts with a
+// bound on their error, and fall back to the pairs, with error-free transformations
+// (two-diff, two-prod), when the bound is not met.
 template <typename T>
-__device__ __forceinline__ void warp_inclusive_sum2(T v, int lane, T& hi, T& lo) {
+struct Pair {
+  T h, l;
+};
+
+// (ah + al) - (bh + bl) as a pair.
+template <typename T>
+__device__ __forceinline__ Pair<T> diff2(T ah, T al, T bh, T bl) {
+  const T s = ah - bh;
+  const T bb = s - ah;
+  const T e = ((ah - (s - bb)) - (bh + bb)) + (al - bl);
+  const T h = s + e;
+  return Pair<T>{h, e - (h - s)};
+}
+
+// x1 * y2 - y1 * x2 from pairs, evaluated with two-prod (fma) and a two-diff.
+template <typename T>
+__device__ __forceinline__ T cross2(Pair<T> x1, Pair<T> y1, Pair<T> x2, Pair<T> y2) {
+  const T p1 = x1.h * y2.h;
+  const T p1l = fma(x1.h, y2.h, -p1) + x1.h * y2.l + x1.l * y2.h;
+  const T p2 = y1.h * x2.h;
+  const T p2l = fma(y1.h, x2.h, -p2) + y1.h * x2.l + y1.l * x2.h;
+  const T s = p1 - p2;
+  const T bb = s - p1;
+  const T e = ((p1 - (s - bb)) - (p2 + bb)) + (p1l - p2l);
+  return s + e;
+}
+
+// Error bounds for the fast path of a turn predicate on the hi parts of pair sums. The hi
+// part of a renormalized pair is the exact sum rounded once (the lo part holds the rest), so
+// a coordinate is within u M of the truth for u the unit roundoff and M the magnitude; a
+// difference of two is within 2 u M + u |diff|, a product of two differences within
+// 2 u M (|dx| + |dy|) + 3 u |p|, and the cross product within 2 u (M_y (|dx1| + |dx2|) +
+// M_x (|dy1| + |dy2|)) + 4 u (|p1| + |p2|) + u |c|. The coefficients below double that.
+template <typename T>
+__device__ __forceinline__ constexpr T bound_m() {  // on the magnitude terms
+  return sizeof(T) == 4 ? T(4 * 5.9604644775390625e-08) : T(4 * 1.1102230246251565e-16);
+}
+template <typename T>
+__device__ __forceinline__ constexpr T bound_p() {  // on the product terms
+  return sizeof(T) == 4 ? T(8 * 5.9604644775390625e-08) : T(8 * 1.1102230246251565e-16);
+}
+
+template <typename acc_t>
+struct Local {  // a point of the chunk: its index, and coordinates from its lane's start
+  int p;
+  acc_t x, y;    // x: weighted only (otherwise the point index is the coordinate)
+  acc_t xl, yl;  // lo parts (float only; otherwise 0)
+};
+
+// Point p of the chunk (p = after its first p elements; the chunk's end has p = its length).
+template <typename C>
+__device__ __forceinline__ Local<typename C::acc> local(const C& c, int p) {
+  Local<typename C::acc> q{p, 0, 0, 0, 0};
+  if (p & (kLanes - 1)) {
+    q.y = c.sy[pad(p - 1)];
+    if (C::kPairs) {
+      q.yl = unpack_lo(q.y, c.syl[pad(p - 1)]);
+    }
+    if (C::kW) {
+      q.x = c.sx[pad(p - 1)];
+      if (C::kPairs) {
+        q.xl = unpack_lo(q.x, c.sxl[pad(p - 1)]);
+      }
+    }
+  }
+  return q;
+}
+
+// b - a in chunk coordinates (b right of a), as a pair: the hi parts of two lane starts
+// differ at the ulp of the chunk's sums, so a slope of the output, formed from this once per
+// vertex, needs the lo parts.
+template <typename C, typename acc_t>
+__device__ __forceinline__ void delta(
+    const C& c, const Local<acc_t>& a, const Local<acc_t>& b, Pair<acc_t>& dx, Pair<acc_t>& dy) {
+  const int la = a.p / kLanes, lb = b.p / kLanes;
+  const Pair<acc_t> ly = diff2(b.y, b.yl, a.y, a.yl);
+  dy = diff2(c.by[0][lb], c.by[1][lb], c.by[0][la], c.by[1][la]);
+  add2(dy.h, dy.l, ly.h, ly.l);
+  if (C::kW) {
+    const Pair<acc_t> lx = diff2(b.x, b.xl, a.x, a.xl);
+    dx = diff2(c.bx[0][lb], c.bx[1][lb], c.bx[0][la], c.bx[1][la]);
+    add2(dx.h, dx.l, lx.h, lx.l);
+  } else {
+    dx = Pair<acc_t>{to_acc<acc_t>(b.p - a.p), acc_t(0)};
+  }
+}
+
+template <typename T>
+__device__ __forceinline__ T warp_inclusive_sum(T v, int lane) {
+  for (int d = 1; d < kLanes; d <<= 1) {
+    const T o = __shfl_up_sync(kFull, v, d);
+    if (lane >= d) {
+      v += o;
+    }
+  }
+  return v;
+}
+
+// (h, l) += v: a two-sum into the pair when PAIRS, a plain addition otherwise.
+template <bool PAIRS, typename T>
+__device__ __forceinline__ void scan_step(T& h, T& l, T v) {
+  if constexpr (PAIRS) {
+    T s, e;
+    two_sum(h, v, s, e);
+    e += l;
+    h = s + e;  // renormalized: |l| stays below half an ulp of h (pack_lo needs that)
+    l = e - (h - s);
+  } else {
+    h += v;
+  }
+}
+
+// Inclusive prefix sums over the warp of v (+ vl), as hi + lo.
+template <typename T>
+__device__ __forceinline__ void warp_inclusive_sum2(T v, T vl, int lane, T& hi, T& lo) {
   hi = v;
-  lo = T(0);
+  lo = vl;
   for (int d = 1; d < kLanes; d <<= 1) {
     const T oh = __shfl_up_sync(kFull, hi, d), ol = __shfl_up_sync(kFull, lo, d);
     if (lane >= d) {
@@ -223,9 +326,10 @@ __device__ __forceinline__ void warp_inclusive_sum2(T v, int lane, T& hi, T& lo)
 // chunk's last thread). warp_totals: per-warp scratch. Ends with a barrier.
 template <typename T, int WARPS>
 __device__ double lane_starts(
-    T total, int lane, int warp, T (*starts)[WARPS * kLanes + 1], T (*warp_totals)[WARPS]) {
+    T total, T total_lo, int lane, int warp, T (*starts)[WARPS * kLanes + 1],
+    T (*warp_totals)[WARPS]) {
   T hi, lo;
-  warp_inclusive_sum2(total, lane, hi, lo);
+  warp_inclusive_sum2(total, total_lo, lane, hi, lo);
   T eh = __shfl_up_sync(kFull, hi, 1), el = __shfl_up_sync(kFull, lo, 1);
   if (lane == 0) {
     eh = el = T(0);
@@ -295,31 +399,63 @@ __device__ __forceinline__ Point2<typename C::acc> chunk_point(const C& c, int p
   Point2<acc_t> q;
   q.p = p;
   acc_t s, e;
-  two_sum(c.by[0][t], inside ? c.sy[pad(p - 1)] : acc_t(0), s, e);
+  const acc_t ly = inside ? c.sy[pad(p - 1)] : acc_t(0);
+  two_sum(c.by[0][t], ly, s, e);
   q.yh = s;
-  q.yl = e + c.by[1][t];
+  q.yl = e + c.by[1][t] + (C::kPairs && inside ? unpack_lo(ly, c.syl[pad(p - 1)]) : acc_t(0));
   if (C::kW) {
-    two_sum(c.bx[0][t], inside ? c.sx[pad(p - 1)] : acc_t(0), s, e);
+    const acc_t lx = inside ? c.sx[pad(p - 1)] : acc_t(0);
+    two_sum(c.bx[0][t], lx, s, e);
     q.xh = s;
-    q.xl = e + c.bx[1][t];
+    q.xl = e + c.bx[1][t] + (C::kPairs && inside ? unpack_lo(lx, c.sxl[pad(p - 1)]) : acc_t(0));
   }
   return q;
+}
+
+// turn2 from the pairs, when the fast path cannot decide. Rarely taken, so kept out of line.
+template <bool W, typename acc_t>
+__device__ __noinline__ acc_t turn2_slow(
+    const Point2<acc_t>& a, const Point2<acc_t>& b, const Point2<acc_t>& d, acc_t x1,
+    acc_t x2) {
+  const Pair<acc_t> py1 = diff2(b.yh, b.yl, a.yh, a.yl), py2 = diff2(d.yh, d.yl, a.yh, a.yl);
+  Pair<acc_t> px1, px2;
+  if (W) {
+    px1 = diff2(b.xh, b.xl, a.xh, a.xl);
+    px2 = diff2(d.xh, d.xl, a.xh, a.xl);
+  } else {
+    px1 = Pair<acc_t>{x1, acc_t(0)};
+    px2 = Pair<acc_t>{x2, acc_t(0)};
+  }
+  return cross2(px1, py1, px2, py2);
 }
 
 // > 0 when a, b, d turn left (counter-clockwise).
 template <bool W, typename acc_t>
 __device__ __forceinline__ acc_t turn2(
     const Point2<acc_t>& a, const Point2<acc_t>& b, const Point2<acc_t>& d) {
-  const acc_t y1 = (b.yh - a.yh) + (b.yl - a.yl), y2 = (d.yh - a.yh) + (d.yl - a.yl);
+  const acc_t y1 = b.yh - a.yh, y2 = d.yh - a.yh;
   acc_t x1, x2;
   if (W) {
-    x1 = (b.xh - a.xh) + (b.xl - a.xl);
-    x2 = (d.xh - a.xh) + (d.xl - a.xl);
+    x1 = b.xh - a.xh;
+    x2 = d.xh - a.xh;
   } else {
     x1 = to_acc<acc_t>(b.p - a.p);
     x2 = to_acc<acc_t>(d.p - a.p);
   }
-  return x1 * y2 - y1 * x2;
+  const acc_t p1 = x1 * y2, p2 = y1 * x2, c = p1 - p2;
+  // A coordinate here is a lane start's hi plus a lane sum's hi, rounded: within 3 u M rather
+  // than u M, so the magnitude terms take three times lane_chain's coefficient.
+  const acc_t my = fmax(fmax(fabs(a.yh), fabs(b.yh)), fabs(d.yh));
+  acc_t bound = fma(3 * bound_m<acc_t>() * my, fabs(x1) + fabs(x2),
+                    bound_p<acc_t>() * (fabs(p1) + fabs(p2)));
+  if (W) {
+    const acc_t mx = fmax(fmax(fabs(a.xh), fabs(b.xh)), fabs(d.xh));
+    bound = fma(3 * bound_m<acc_t>() * mx, fabs(y1) + fabs(y2), bound);
+  }
+  if (fabs(c) > bound) {
+    return c;
+  }
+  return turn2_slow<W>(a, b, d, x1, x2);
 }
 
 // The bridge between the node of points [start, shared] and the one of [shared, end] (lanes
@@ -381,21 +517,59 @@ __device__ __forceinline__ uint32_t between(int a, int b, int t) {
   return upto & ~((1u << lo) - 1u);
 }
 
+// lane_chain's turn from the pairs, when the fast path cannot decide: the lo parts are read
+// by the points' indices (point 0 is 0). Rarely taken, so kept out of line.
+template <bool W, typename acc_t>
+__device__ __noinline__ acc_t lane_turn_slow(
+    const int16_t* syl, const int16_t* sxl, int ka, int kb, int k, acc_t ax, acc_t ay, acc_t bx,
+    acc_t by, acc_t qx, acc_t qy, acc_t dx1, acc_t dx2) {
+  const acc_t al = ka ? unpack_lo(ay, syl[ka - 1]) : acc_t(0);
+  const acc_t bl = kb ? unpack_lo(by, syl[kb - 1]) : acc_t(0);
+  const acc_t ql = unpack_lo(qy, syl[k - 1]);
+  const Pair<acc_t> py1 = diff2(by, bl, ay, al), py2 = diff2(qy, ql, ay, al);
+  Pair<acc_t> px1{dx1, acc_t(0)}, px2{dx2, acc_t(0)};
+  if (W) {
+    const acc_t axl = ka ? unpack_lo(ax, sxl[ka - 1]) : acc_t(0);
+    const acc_t bxl = kb ? unpack_lo(bx, sxl[kb - 1]) : acc_t(0);
+    px1 = diff2(bx, bxl, ax, axl);
+    px2 = diff2(qx, unpack_lo(qx, sxl[k - 1]), ax, axl);
+  }
+  return cross2(px1, py1, px2, py2);
+}
+
 // The monotone chain over one lane's points 0..count, point k's cumulative sums being sy[k - 1]
 // (and sx[k - 1]; point 0 is the lane's start): the hull's points as the bits of the result
 // (point count, the lane's end, belongs to the next lane and has none). The stack is the set
 // bits plus its top b; a is the entry under b. Every iteration either pops b or pushes the
 // next point q, chosen by selects, and both loads it might need are made: no branch in the
-// loop, so lanes stay together and the body stays short (the kernels are bound by
-// instructions issued, not by latency).
-template <bool W, typename acc_t>
-__device__ __forceinline__ uint32_t lane_chain(const acc_t* sy, const acc_t* sx, int count) {
+// loop but the rare slow path, so lanes stay together and the body stays short.
+//
+// PAIRS: the sums are pairs hi + lo (lo parts packed in syl, sxl). The turn is computed from
+// the hi parts and accepted when it exceeds its error bound: slack_y (slack_x) is bound_m
+// times the lane's largest sum of w * y (of w).
+template <bool W, bool PAIRS, typename acc_t>
+__device__ __forceinline__ uint32_t lane_chain(
+    const acc_t* sy, const int16_t* syl, const acc_t* sx, const int16_t* sxl, int count,
+    acc_t slack_y, acc_t slack_x) {
   uint32_t mask = count > 0 ? 1u : 0u;
   int ka = 0, kb = 0, k = 1;  // the stack has two entries or more exactly when b is not point 0
   acc_t ax = 0, ay = 0, bx = 0, by = 0;
   acc_t qx = W ? sx[0] : acc_t(1), qy = sy[0];
   while (k <= count) {
-    const bool pop = kb != 0 && (bx - ax) * (qy - ay) - (by - ay) * (qx - ax) <= 0;
+    const acc_t dx1 = bx - ax, dy1 = by - ay, dx2 = qx - ax, dy2 = qy - ay;
+    const acc_t p1 = dx1 * dy2, p2 = dy1 * dx2;
+    acc_t c = p1 - p2;
+    if constexpr (PAIRS) {
+      acc_t bound =
+          fma(slack_y, fabs(dx1) + fabs(dx2), bound_p<acc_t>() * (fabs(p1) + fabs(p2)));
+      if (W) {
+        bound = fma(slack_x, fabs(dy1) + fabs(dy2), bound);
+      }
+      if (!(fabs(c) > bound)) {
+        c = lane_turn_slow<W>(syl, sxl, ka, kb, k, ax, ay, bx, by, qx, qy, dx1, dx2);
+      }
+    }
+    const bool pop = kb != 0 && c <= 0;
     const uint32_t popped = mask & ~(1u << kb);
     const uint32_t pushed = mask | ((k < count ? 1u : 0u) << (k & (kLanes - 1)));
     const int under = kLanes - 1 - __clz(popped & ((1u << ka) - 1u));  // -1: a is point 0
@@ -418,6 +592,49 @@ __device__ __forceinline__ uint32_t lane_chain(const acc_t* sy, const acc_t* sx,
     k += pop ? 0 : 1;
   }
   return mask;
+}
+
+// A lane's hull: its elements' values (at base.., padded) become its cumulative sums, in
+// place, and lane_chain finds the hull of points 0..count. Returns the hull's mask; (ty, tyl)
+// and (tx, txl) are the lane's totals of w * y and of w (for unweighted data, tx = count).
+template <typename C>
+__device__ __forceinline__ uint32_t lane_hull(
+    C& c, int base, int count, typename C::acc& ty, typename C::acc& tyl, typename C::acc& tx,
+    typename C::acc& txl) {
+  using acc_t = typename C::acc;
+  constexpr bool W = C::kW;
+  acc_t my = 0, mx = 0;  // the largest sums, for lane_chain's error bound
+  acc_t py[kLanes], px[W ? kLanes : 1];
+#pragma unroll
+  for (int k = 0; k < kLanes; ++k) {
+    py[k] = c.sy[base + k];
+    if (W) {
+      px[k] = c.sx[base + k];
+    }
+  }
+#pragma unroll
+  for (int k = 0; k < kLanes; ++k) {  // py[k]: point k + 1
+    scan_step<C::kPairs>(ty, tyl, k < count ? py[k] : acc_t(0));
+    c.sy[base + k] = ty;
+    my = fmax(my, fabs(ty));
+    if (C::kPairs) {
+      c.syl[base + k] = pack_lo(ty, tyl);
+    }
+    if (W) {
+      scan_step<C::kPairs>(tx, txl, k < count ? px[k] : acc_t(0));
+      c.sx[base + k] = tx;
+      mx = fmax(mx, fabs(tx));
+      if (C::kPairs) {
+        c.sxl[base + k] = pack_lo(tx, txl);
+      }
+    }
+  }
+  if (!W) {
+    tx = acc_t(count);
+  }
+  return lane_chain<W, C::kPairs>(c.sy + base, c.syl + (C::kPairs ? base : 0),
+                                  c.sx + (W ? base : 0), c.sxl + (W && C::kPairs ? base : 0),
+                                  count, bound_m<acc_t>() * my, bound_m<acc_t>() * mx);
 }
 
 struct Seg {  // vertices lo..hi of one chunk's hull; voff: where that hull starts
@@ -489,45 +706,17 @@ __global__ void __launch_bounds__(WARPS * kLanes) chunk_kernel(
   TI_MARK(0);
   TI_STOP(0, __float_as_int(static_cast<float>(c.sy[pad(t)])) + int(nan));
 
-  // Each lane: the hull of its points 0..count by the monotone chain. The stack is the set
-  // bits of mask (points the lane owns: 0..count-1; point count is the next lane's 0) plus
-  // its top b; a is the entry under b. Every iteration either pops b or pushes the next point
-  // q, chosen by selects rather than branches: lanes stay together and the loop body stays
-  // short (the kernel is bound by instructions issued, not by latency).
+  // Each lane: the hull of its points 0..count (point count is the next lane's 0).
   const int count = imax(0, imin(kLanes, len - t * kLanes));
-  uint32_t mask = count > 0 ? 1u : 0u;
-  acc_t tx = 0, ty = 0;
-  {
-    const int base = t * (kLanes + 1);
-    acc_t py[kLanes], px[W ? kLanes : 1];
-#pragma unroll
-    for (int k = 0; k < kLanes; ++k) {
-      py[k] = c.sy[base + k];
-      if (W) {
-        px[k] = c.sx[base + k];
-      }
-    }
-#pragma unroll
-    for (int k = 0; k < kLanes; ++k) {  // py[k]: point k + 1
-      ty += k < count ? py[k] : acc_t(0);
-      c.sy[base + k] = ty;
-      if (W) {
-        tx += k < count ? px[k] : acc_t(0);
-        c.sx[base + k] = tx;
-      }
-    }
-    if (!W) {
-      tx = acc_t(count);
-    }
-    mask = lane_chain<W>(c.sy + base, c.sx + (W ? base : 0), count);
-  }
+  acc_t tx = 0, ty = 0, txl = 0, tyl = 0;
+  uint32_t mask = lane_hull(c, t * (kLanes + 1), count, ty, tyl, tx, txl);
 
   TI_MARK(1);
   TI_STOP(1, static_cast<int>(mask) ^ __float_as_int(static_cast<float>(ty)));
-  const double iy = lane_starts<acc_t, WARPS>(ty, lane, warp, c.by, c.wy);
+  const double iy = lane_starts<acc_t, WARPS>(ty, tyl, lane, warp, c.by, c.wy);
   double ix = 0.0;
   if constexpr (W) {
-    ix = lane_starts<acc_t, WARPS>(tx, lane, warp, c.bx, c.wx);
+    ix = lane_starts<acc_t, WARPS>(tx, txl, lane, warp, c.bx, c.wx);
   }
 
   TI_MARK(2);
@@ -617,9 +806,8 @@ __global__ void __launch_bounds__(WARPS * kLanes) chunk_kernel(
     // Each lane its own 32 elements: backwards, the slope of the edge out of each of its
     // vertices (to the next vertex: its own, or the first one of a later lane, or the end);
     // forwards, every element takes the slope of the last vertex at or before it (for the
-    // elements before its first vertex, the last slope of an earlier lane). No popc, no ffs,
-    // a division per vertex only. The slopes are staged where the sums were, then written
-    // coalesced.
+    // elements before its first vertex, the last slope of an earlier lane). The slopes are
+    // staged where the sums were, then written coalesced.
     const int p0 = t * kLanes;
     int after = mask ? p0 + __ffs(mask) - 1 : len;  // suffix minimum of first vertices
     for (int d = 1; d < kLanes; d <<= 1) {
@@ -650,14 +838,15 @@ __global__ void __launch_bounds__(WARPS * kLanes) chunk_kernel(
       for (int k = kLanes - 1; k >= 0; --k) {
         if ((mask >> k) & 1u) {
           const Local<acc_t> pa = local(c, p0 + k);
-          acc_t dx, dy;
+          Pair<acc_t> dx, dy;
           if (nv / kLanes == t) {  // both ends in this lane: no lane starts involved
-            dy = pn.y - pa.y;
-            dx = W ? pn.x - pa.x : to_acc<acc_t>(nv - p0 - k);
+            dy = diff2(pn.y, pn.yl, pa.y, pa.yl);
+            dx = W ? diff2(pn.x, pn.xl, pa.x, pa.xl)
+                   : Pair<acc_t>{to_acc<acc_t>(nv - p0 - k), acc_t(0)};
           } else {
             delta(c, pa, pn, dx, dy);
           }
-          slope[k] = sign * (dy / dx);
+          slope[k] = sign * ((dy.h + dy.l) / (dx.h + dx.l));
           if (!found) {
             last = slope[k];
             found = true;
@@ -718,10 +907,10 @@ __global__ void __launch_bounds__(WARPS * kLanes) chunk_kernel(
     const int u = p / kLanes;
     h.p[voff + i] = static_cast<int32_t>(j * kN + p);
     h.y[voff + i] = static_cast<double>(c.by[0][u]) + static_cast<double>(c.by[1][u]) +
-                    static_cast<double>(q.y);
+                    static_cast<double>(q.y) + static_cast<double>(q.yl);
     if (W) {
       h.x[voff + i] = static_cast<double>(c.bx[0][u]) + static_cast<double>(c.bx[1][u]) +
-                      static_cast<double>(q.x);
+                      static_cast<double>(q.x) + static_cast<double>(q.xl);
     }
   };
   {
@@ -811,36 +1000,12 @@ __global__ void __launch_bounds__(WARPS * kLanes) packed_kernel(
   // The lane's hull, as in chunk_kernel.
   const int q = lane / L, u = lane % L;  // this lane's problem, and its place in it
   const int count = q < rows ? imax(0, imin(kLanes, n - u * kLanes)) : 0;
-  uint32_t mask = count > 0 ? 1u : 0u;
-  acc_t tx = 0, ty = 0;
-  {
-    const int base = lane * (kLanes + 1);
-    acc_t py[kLanes], px[W ? kLanes : 1];
-#pragma unroll
-    for (int k = 0; k < kLanes; ++k) {
-      py[k] = c.sy[base + k];
-      if (W) {
-        px[k] = c.sx[base + k];
-      }
-    }
-#pragma unroll
-    for (int k = 0; k < kLanes; ++k) {
-      ty += k < count ? py[k] : acc_t(0);
-      c.sy[base + k] = ty;
-      if (W) {
-        tx += k < count ? px[k] : acc_t(0);
-        c.sx[base + k] = tx;
-      }
-    }
-    if (!W) {
-      tx = acc_t(count);
-    }
-    mask = lane_chain<W>(c.sy + base, c.sx + (W ? base : 0), count);
-  }
+  acc_t tx = 0, ty = 0, txl = 0, tyl = 0;
+  uint32_t mask = lane_hull(c, lane * (kLanes + 1), count, ty, tyl, tx, txl);
 
   // Lane starts, from each problem's start: prefix sums restarted at every problem.
-  auto starts = [&](acc_t total, acc_t (*b)[kLanes + 1]) {
-    acc_t hi = total, lo = 0;
+  auto starts = [&](acc_t total, acc_t total_lo, acc_t (*b)[kLanes + 1]) {
+    acc_t hi = total, lo = total_lo;
     for (int d = 1; d < L; d <<= 1) {
       const acc_t oh = __shfl_up_sync(kFull, hi, d), ol = __shfl_up_sync(kFull, lo, d);
       if (u >= d) {
@@ -851,9 +1016,9 @@ __global__ void __launch_bounds__(WARPS * kLanes) packed_kernel(
     b[0][lane] = u ? eh : acc_t(0);
     b[1][lane] = u ? el : acc_t(0);
   };
-  starts(ty, c.by);
+  starts(ty, tyl, c.by);
   if constexpr (W) {
-    starts(tx, c.bx);
+    starts(tx, txl, c.bx);
   }
   __syncwarp();
   const int first_point = q * span, end_point = q * span + n;
@@ -866,11 +1031,11 @@ __global__ void __launch_bounds__(WARPS * kLanes) packed_kernel(
       acc_t s, err;
       two_sum(c.by[0][t], c.sy[pad(e)], s, err);
       pt.yh = s;
-      pt.yl = err + c.by[1][t];
+      pt.yl = err + c.by[1][t] + (C::kPairs ? unpack_lo(c.sy[pad(e)], c.syl[pad(e)]) : acc_t(0));
       if (W) {
         two_sum(c.bx[0][t], c.sx[pad(e)], s, err);
         pt.xh = s;
-        pt.xl = err + c.bx[1][t];
+        pt.xl = err + c.bx[1][t] + (C::kPairs ? unpack_lo(c.sx[pad(e)], c.sxl[pad(e)]) : acc_t(0));
       }
     }
     return pt;
@@ -923,9 +1088,10 @@ __global__ void __launch_bounds__(WARPS * kLanes) packed_kernel(
     for (int k = kLanes - 1; k >= 0; --k) {
       if ((mask >> k) & 1u) {
         const Point2<acc_t> pa = load(p0 + k);
-        const acc_t dy = (pn.yh - pa.yh) + (pn.yl - pa.yl);
-        const acc_t dx = W ? (pn.xh - pa.xh) + (pn.xl - pa.xl) : to_acc<acc_t>(nv - p0 - k);
-        slope[k] = sign * (dy / dx);
+        const Pair<acc_t> dy = diff2(pn.yh, pn.yl, pa.yh, pa.yl);
+        const Pair<acc_t> dx = W ? diff2(pn.xh, pn.xl, pa.xh, pa.xl)
+                                 : Pair<acc_t>{to_acc<acc_t>(nv - p0 - k), acc_t(0)};
+        slope[k] = sign * ((dy.h + dy.l) / (dx.h + dx.l));
         if (!found) {
           last = slope[k];
           found = true;
@@ -969,11 +1135,12 @@ struct Pt {
   double x, y;
 };
 
+// The plain cross product (> 0: a left turn), without Row::turn's filter.
 __device__ __forceinline__ double turn(const Pt& a, const Pt& b, const Pt& d) {
   return (b.x - a.x) * (d.y - a.y) - (b.y - a.y) * (d.x - a.x);
 }
 
-// The biased exponent of |v| (0 for zero and subnormals), from the high word: integer work.
+// The biased exponent of |v| (0 for zero and subnormals), read from the high word.
 __device__ __forceinline__ int bexp(double v) {
   return static_cast<int>((static_cast<unsigned>(__double2hiint(v)) << 1) >> 21);
 }
@@ -983,7 +1150,7 @@ struct Row {  // one problem's vertices, in its coordinates
   Hulls h;
   const double* cy;  // chunk starts, hi parts
   const double* cx;
-  const double* cyl = nullptr;  // their lo parts (needed by slope and the exact turn only)
+  const double* cyl = nullptr;  // their lo parts (needed by slope and the local turn only)
   const double* cxl = nullptr;
 
   // Absolute coordinates, one addition each: cheap, and exact enough for most predicates.
@@ -994,25 +1161,23 @@ struct Row {  // one problem's vertices, in its coordinates
 
   // The turn of a, b, d (> 0: a left turn), with a floating-point filter. The absolute
   // coordinates are sums of up to 1e10 rounded to double, so the cross product computed from
-  // them carries an error of up to a few ulp of that magnitude times the edge lengths; if the
-  // result is larger than that bound its sign is right. Otherwise - nearly collinear points,
-  // or far from the origin - it is recomputed from coordinates relative to a, formed from
-  // differences of the chunk starts' hi and lo parts and of the chunks' own coordinates,
-  // which see the local geometry; for that the points are named again as (list, segment,
-  // position), which the callers have at hand - a Pt carries nothing but its coordinates, so
-  // that the fast path keeps the registers of the plain cross product. Without lo parts, the
-  // cheap result is returned as it is.
+  // them carries an error of a few ulp of that magnitude times the edge lengths; a result
+  // larger than that bound has the right sign. Otherwise - nearly collinear points, or far
+  // from the origin - the turn is recomputed from coordinates relative to a, formed from
+  // differences of the chunk starts' hi and lo parts and of the chunks' own coordinates. The
+  // points are passed again as (list, segment, position) for that. Without lo parts the
+  // filtered result is returned as it is.
   //
-  // The bound is compared by exponents, in integer arithmetic on the doubles' high words:
-  // the merges of this GPU are bound by its double throughput (1/32 of the float rate), the
-  // cross product itself is seven double operations, and a bound in double or float (the
-  // conversions run at the double rate too) doubled the merge time. With u = 2^-53 the error
-  // is below 8u (M (|bx| + |by| + |dx| + |dy|) + |p1| + |p2|) <= 16u M (|bx| + |by| + |dx| +
-  // |dy|) for M the largest coordinate, as |p1| + |p2| <= M (|bx| + |by|) (correctness.md).
-  // Bounding each factor by a power of two from its exponent, M <= 2^(E_m + 1) with E_m <=
-  // max(E_a, E_e) + 1 over a's coordinates and the four differences, and the sum of
-  // differences by 2^(E_e + 3), gives a bound of at most 2^(E_m + E_e - 45), and |c| >=
-  // 2^E_c for a normal c. Zero and subnormal results take the exact path.
+  // The bound costs no floating-point operation (the merges are bound by double
+  // throughput): it is compared by exponents. With u = 2^-53 the error is below
+  // 8u (M (|bx| + |by| + |dx| + |dy|) + |p1| + |p2|) <= 16u M (|bx| + |by| + |dx| + |dy|) for
+  // M the largest coordinate, as |p1| + |p2| <= M (|bx| + |by|). Bounding each factor by a
+  // power of two from its exponent - M <= 2^(E_m + 1) with E_m <= max(E_a, E_e) + 1 over a's
+  // coordinates and the four differences, the sum of the differences by 2^(E_e + 3) - gives
+  // a bound of at most 2^(E_m + E_e - 45), while |c| >= 2^E_c for a normal c. The derivation
+  // assumes normal numbers, so a zero or subnormal c or difference always takes the slow
+  // path. That path is double arithmetic too, not exact: its rounding is at the scale of the
+  // chunks' sums rather than the problem's.
   __device__ __forceinline__ double turn(
       const Pt& a, const Pt& b, const Pt& d, const Seg* A, int as, int ap, const Seg* B, int bs,
       int bp, const Seg* D, int ds, int dp) const {
@@ -1021,9 +1186,10 @@ struct Row {  // one problem's vertices, in its coordinates
     const int ea = imax(bexp(a.x), bexp(a.y));
     const int ee = imax(imax(bexp(bx), bexp(by)), imax(bexp(dx), bexp(dy)));
     const int em = imax(ea, ee) + 1;
+    const int ec = bexp(c);
     // Biased exponents: E = e - 1023, so the condition E_c >= E_m + E_e - 44 reads
     // e_c >= e_m + e_e - 1067.
-    if (bexp(c) >= em + ee - 1067 || cyl == nullptr) {
+    if ((ec > 0 && ee > 0 && ec >= em + ee - 1067) || cyl == nullptr) {
       return c;
     }
     double rbx, rby, rdx, rdy;
@@ -1083,7 +1249,7 @@ __device__ int warp_first_false(int count, int lane, Pred pred) {
   return lo;
 }
 
-// The same, by one thread.
+// The same, by the whole warp (WARP) or by one thread.
 template <bool WARP, typename Pred>
 __device__ int first_false(int count, int lane, Pred pred) {
   if constexpr (WARP) {
@@ -1296,12 +1462,17 @@ __device__ void merge_pair(Hulls h, const Row<W>& row, int64_t first, int64_t ha
 
   const Seg last = L[nl - 1], head = R[0];
   const Pt shared = row.at(last, last.hi);
-  const int bs = last.hi > last.lo ? nl - 1 : nl - 2, bp = last.hi > last.lo ? last.hi - 1 : L[nl - 2].hi;
-  const int as = head.hi > head.lo ? 0 : 1, ap = head.hi > head.lo ? head.lo + 1 : R[1].lo;
-  const Pt before = row.at(L[bs], bp), after = row.at(R[as], ap);
-  int keep, hi_l, from, lo_r;  // L keeps segments [0, keep), the last up to hi_l; then R's from `from`
-  if (row.turn(before, shared, after, L, bs, bp, L, nl - 1, last.hi, R, as, ap) > 0) {
-    // Convex at the shared point: concatenate.
+  // The vertices next to the shared one: before it in L, after it in R (segment, position).
+  const int before_s = last.hi > last.lo ? nl - 1 : nl - 2;
+  const int before_p = last.hi > last.lo ? last.hi - 1 : L[nl - 2].hi;
+  const int after_s = head.hi > head.lo ? 0 : 1;
+  const int after_p = head.hi > head.lo ? head.lo + 1 : R[1].lo;
+  const Pt before = row.at(L[before_s], before_p), after = row.at(R[after_s], after_p);
+  // The merged list: L's segments [0, keep), the last cut at hi_l, then R's from `from` on,
+  // the first cut at lo_r.
+  int keep, hi_l, from, lo_r;
+  if (row.turn(before, shared, after, L, before_s, before_p, L, nl - 1, last.hi, R, after_s,
+               after_p) > 0) {  // convex at the shared point: concatenate
     keep = nl;
     hi_l = last.hi;
     from = 0;
@@ -1533,7 +1704,7 @@ __global__ void merge_stats_kernel(
 // Chunk starts: per row, the exclusive prefix sums of its chunks' totals as hi + lo pairs,
 // plus the row's total in column per_row. One block per row; a thread sums a slice of
 // chunks sequentially (two_sum), the block scans the slices, the thread writes its slice.
-constexpr int kStartThreads = 256;  // 1024 made the double-double code spill registers
+constexpr int kStartThreads = 256;  // more threads spill the double-double scan's registers
 
 // THREADS: 256 for long rows, 32 (one warp, no block scan) for rows of up to 32 chunks.
 template <int THREADS>
@@ -1723,7 +1894,7 @@ void run(const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& 
       y, w, increasing, out,
       [&](int64_t chunks, int64_t n, int64_t per_row, scalar_t sign, scalar_t* o, Hulls h,
           cudaStream_t stream) {
-        // As much of the SM's memory as shared memory as it allows: it limits blocks per SM.
+        // The largest shared memory carveout: shared memory limits the blocks per SM.
         static const bool carved = [] {
           C10_CUDA_CHECK(cudaFuncSetAttribute(chunk_kernel<scalar_t, W, warps>,
                                               cudaFuncAttributePreferredSharedMemoryCarveout,
@@ -1736,14 +1907,15 @@ void run(const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& 
       });
 }
 
-// The chunk size, measured on a T4: a problem of up to 4096 elements is one chunk of as few
-// warps as cover it (finished in one kernel, no warp idle); longer ones are split into
-// one-warp chunks, whose hulls cost least to build. TI_CHUNK_WARPS (1, 2 or 4) overrides it.
+// Problems of up to 512 elements, several per warp (packed_kernel).
 template <typename scalar_t, bool W>
 void run_packed(const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out) {
   // Warps per block, each on its own problems: up to 4, as shared memory allows.
-  constexpr int one = static_cast<int>(sizeof(Chunk<scalar_t, W, 1>)) + kLanes * 4;
-  constexpr int warps = 48 * 1024 / one >= 4 ? 4 : 48 * 1024 / one >= 2 ? 2 : 1;
+  constexpr int per_warp_shared =
+      static_cast<int>(sizeof(Chunk<scalar_t, W, 1>)) + kLanes * static_cast<int>(sizeof(int));
+  constexpr int warps = 48 * 1024 / per_warp_shared >= 4   ? 4
+                        : 48 * 1024 / per_warp_shared >= 2 ? 2
+                                                           : 1;
   const int64_t batch = y.size(0);
   const int n = static_cast<int>(y.size(1));
   int L = 1;
@@ -1759,6 +1931,9 @@ void run_packed(const at::Tensor& y, const at::Tensor* w, bool increasing, at::T
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// The chunk size, tuned on a T4: a problem of up to 4096 elements is one chunk of as few warps
+// as cover it (finished in one kernel, no warp idle); longer ones are split into one-warp
+// chunks, whose hulls cost least to build. TI_CHUNK_WARPS (1, 2 or 4) overrides it.
 template <typename scalar_t, bool W>
 void run_sized(const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out) {
   constexpr int most = chunk_warps<scalar_t, W>();
@@ -1789,7 +1964,8 @@ at::Tensor isotonic_tiles_cuda(
     TORCH_CHECK(w->sizes() == y.sizes() && w->scalar_type() == y.scalar_type(), "bad w");
     TORCH_CHECK(w->is_contiguous(), "w must be contiguous");
   }
-  TORCH_CHECK(y.size(1) < (int64_t{1} << 31) - 1, "problems must have fewer than 2^31 - 1 elements");
+  TORCH_CHECK(y.size(1) < (int64_t{1} << 31) - 1,
+              "problems must have fewer than 2^31 - 1 elements");
   const c10::cuda::CUDAGuard guard(y.device());
   at::Tensor out = at::empty_like(y);
   AT_DISPATCH_FLOATING_TYPES(y.scalar_type(), "isotonic_tiles_cuda", [&] {

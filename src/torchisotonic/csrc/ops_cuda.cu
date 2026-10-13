@@ -84,7 +84,7 @@ constexpr int kRound = 8;           // points per chunk loaded per round
 // threads that load one chunk's points read neighbouring addresses.
 //
 // Inside a chunk the numbers are small, so the hull is computed in the input's precision:
-// float32 input costs float32 arithmetic, which a T4 does 32 times faster than float64. The
+// float32 input costs float32 arithmetic, which most GPUs run far faster than float64. The
 // vertices and the chunk totals are then kept in float64 for the merges.
 template <typename scalar_t, int MAX>
 __global__ void chunk_hull_kernel(
@@ -274,7 +274,8 @@ at::Tensor isotonic_hull_cuda(
   TORCH_CHECK(centre.scalar_type() == at::kDouble && centre.numel() == y.size(0), "bad centre");
   TORCH_CHECK(chunk >= 1 && chunk <= 512 && y.size(1) >= 1, "chunk must be in [1, 512], n >= 1");
   TORCH_CHECK(y.size(0) < 65536, "at most 65535 problems at a time");
-  TORCH_CHECK(y.size(1) < (int64_t{1} << 31) - 1, "problems must have fewer than 2^31 - 1 elements");
+  TORCH_CHECK(y.size(1) < (int64_t{1} << 31) - 1,
+              "problems must have fewer than 2^31 - 1 elements");
   const c10::cuda::CUDAGuard guard(y.device());
   const int64_t batch = y.size(0), n = y.size(1);
   const int64_t nchunks = (n + chunk - 1) / chunk;

@@ -102,9 +102,9 @@ def _block_sums(out: Tensor, *values: Tensor) -> list[Tensor]:
     """For every element, the sums of each of ``values`` over its block of the fit ``out``.
 
     A block is a run of equal fitted values in a row: neighbouring blocks have different
-    means. Equal up to 16 units in the last place, which the fit's rounding cannot tell
-    apart: where two neighbouring blocks have the same mean (and the fit is not
-    differentiable), they count as one, whatever computed the fit.
+    means. Values within 16 units in the last place count as equal, since the fit's rounding
+    cannot tell them apart; so two neighbouring blocks with the same mean (where the fit is
+    not differentiable) count as one, whatever computed the fit.
 
     No host synchronisation: the blocks are numbered by a prefix sum over all rows, and
     summed into a buffer as long as the whole batch.

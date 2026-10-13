@@ -1,5 +1,5 @@
-// torchisotonic::isotonic_tiles on CUDA: every shape of problem, close to memory bandwidth.
-// The kernels and how they work are in tiles.cuh, and those of the gradient in grad.cuh.
+// torchisotonic::isotonic_tiles and isotonic_grad on CUDA, for every shape of problem. The
+// kernels and how they work are in tiles.cuh, and those of the gradient in grad.cuh.
 #include "grad.cuh"
 #include "tiles.cuh"
 
@@ -31,8 +31,8 @@ at::Tensor tiles_phases(const at::Tensor& like, int64_t stop) {
   // descriptors, vertices.
   C10_CUDA_CHECK(cudaMemcpyFromSymbol(o + 16, merge_counts, sizeof(merge_counts)));
   C10_CUDA_CHECK(cudaMemcpyFromSymbol(o + 18, merge_level_stats, sizeof(merge_level_stats)));
-  const unsigned long long zero2[2] = {};
-  C10_CUDA_CHECK(cudaMemcpyToSymbol(merge_counts, zero2, sizeof(zero2)));
+  const unsigned long long zero_counts[2] = {};
+  C10_CUDA_CHECK(cudaMemcpyToSymbol(merge_counts, zero_counts, sizeof(zero_counts)));
   static const unsigned long long zero_levels[kStatRounds][3] = {};
   C10_CUDA_CHECK(cudaMemcpyToSymbol(merge_level_stats, zero_levels, sizeof(zero_levels)));
   o[8] = attr.numRegs;
