@@ -35,5 +35,5 @@ until kaggle datasets status "$DATASET" 2>/dev/null | grep -qi ready; do sleep 5
 
 cp kaggle/kernel/kernel-metadata.json "$STAGE/kernel/"
 steps=$(printf '"%s", ' "${@:-tests}")
-sed "s/^STEPS = .*/STEPS = [${steps%, }]/" kaggle/kernel/run.py > "$STAGE/kernel/run.py"
+sed "s|^STEPS = .*|STEPS = [${steps%, }]|" kaggle/kernel/run.py > "$STAGE/kernel/run.py"  # | : steps may hold /
 kaggle kernels push -p "$STAGE/kernel" --accelerator NvidiaTeslaT4  # Kaggle's only GPU now

@@ -11,3 +11,4 @@ build/
 .hypothesis/
 .DS_Store
 kaggle/output/
+cloud/output/

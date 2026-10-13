@@ -2,6 +2,9 @@
 
 STEPS is filled in by push.sh. Everything prints to the log, and the results land in
 /kaggle/working, which `kaggle kernels output` downloads.
+
+Elsewhere (cloud/modal_bench.py) the code is already in place: TI_SRC names it, TI_OUT where
+results go, and TI_STEPS the steps, separated by spaces.
 """
 
 import glob
@@ -13,8 +16,10 @@ import tarfile
 import time
 
 STEPS = ["tests"]  # replaced by push.sh
-SRC = "/kaggle/working/torchisotonic"
-OUT = "/kaggle/working"
+if os.environ.get("TI_STEPS"):
+    STEPS = os.environ["TI_STEPS"].split()
+SRC = os.environ.get("TI_SRC", "/kaggle/working/torchisotonic")
+OUT = os.environ.get("TI_OUT", "/kaggle/working")
 START = time.perf_counter()
 
 
@@ -33,22 +38,24 @@ def sh(cmd: str) -> int:
         return 1
 
 
-# Kaggle mounts datasets under /kaggle/input (lately /kaggle/input/datasets/<owner>/<name>)
-# and may unpack archives itself, so accept the archive or the unpacked folder.
-archives = glob.glob("/kaggle/input/**/torchisotonic.tar.gz", recursive=True)
-projects = glob.glob("/kaggle/input/**/pyproject.toml", recursive=True)
-shutil.rmtree(SRC, ignore_errors=True)
-if archives:
-    with tarfile.open(archives[0]) as tar:
-        tar.extractall(SRC, filter="data")
-elif projects:
-    shutil.copytree(os.path.dirname(projects[0]), SRC)
-else:
-    for root, _, files in os.walk("/kaggle/input"):
-        print(root, files[:10])
-    sys.exit("found neither torchisotonic.tar.gz nor pyproject.toml under /kaggle/input")
-with open(f"{SRC}/SOURCE") as f:
-    print(f.read(), flush=True)
+if "TI_SRC" not in os.environ:
+    # Kaggle mounts datasets under /kaggle/input (lately /kaggle/input/datasets/<owner>/<name>)
+    # and may unpack archives itself, so accept the archive or the unpacked folder.
+    archives = glob.glob("/kaggle/input/**/torchisotonic.tar.gz", recursive=True)
+    projects = glob.glob("/kaggle/input/**/pyproject.toml", recursive=True)
+    shutil.rmtree(SRC, ignore_errors=True)
+    if archives:
+        with tarfile.open(archives[0]) as tar:
+            tar.extractall(SRC, filter="data")
+    elif projects:
+        shutil.copytree(os.path.dirname(projects[0]), SRC)
+    else:
+        for root, _, files in os.walk("/kaggle/input"):
+            print(root, files[:10])
+        sys.exit("found neither torchisotonic.tar.gz nor pyproject.toml under /kaggle/input")
+if os.path.exists(f"{SRC}/SOURCE"):
+    with open(f"{SRC}/SOURCE") as f:
+        print(f.read(), flush=True)
 
 sh("nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv")
 sh("pip install -q pytest pytest-cov hypothesis scipy scikit-learn ninja")
@@ -105,6 +112,9 @@ for step in STEPS:  # variant:<name>: that variant alone, with the profile
         sh(f"cd {SRC} && timeout 600 python experiments/run.py --profile {step[8:]}")
 if not failed and "phases" in STEPS:
     sh(f"cd {SRC} && python bench/phases.py")
+for step in STEPS:  # phases:<dir>: the phases of another copy of the sources
+    if not failed and step.startswith("phases:"):
+        sh(f"cd {SRC} && python bench/phases.py --csrc {step[7:]}")
 if not failed and ("bench" in STEPS or "bench-quick" in STEPS):
     quick = "--quick" if "bench-quick" in STEPS else ""
     failed = sh(f"cd {SRC} && python bench/bench.py {quick}")

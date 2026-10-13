@@ -10,17 +10,24 @@ whole kernel cut after each phase (one chunk per problem, so nothing runs after 
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
 import torch
 from torch.utils import cpp_extension
 
+# --csrc DIR: build another copy of the sources (e.g. an earlier commit's, extracted beside
+# the tree) for the same measurements, in a separate process: the operator names are fixed.
 CSRC = Path(__file__).parents[1] / "src" / "torchisotonic" / "csrc"
+if "--csrc" in sys.argv:
+    CSRC = Path(sys.argv[sys.argv.index("--csrc") + 1]).resolve()
 PHASES = ["load", "lane hulls", "lane starts", "merge lanes", "write"]
+EXT = "torchisotonic_phases_" + "".join(ch for ch in str(CSRC) if ch.isalnum())[-40:]
 
+print(f"sources: {CSRC}", flush=True)
 cpp_extension.load(
-    name="torchisotonic_phases",
+    name=EXT,
     sources=[str(CSRC / f) for f in ("ops.cpp", "ops_cuda.cu", "ops_tiles.cu")],
     extra_cflags=["-O3"],
     extra_cuda_cflags=["-O3", "-DTI_PHASES"],
@@ -90,7 +97,7 @@ for (name, make), (batch, n) in [((k, v), (100_000, 1000)) for k, v in CASES.ite
 # Instructions per kernel in the binary (a big unrolled kernel can overflow the instruction cache).
 import subprocess  # noqa: E402
 
-so = next(Path(cpp_extension._get_build_directory("torchisotonic_phases", False)).glob("*.so"))
+so = next(Path(cpp_extension._get_build_directory(EXT, False)).glob("*.so"))
 sass = subprocess.run(["cuobjdump", "-sass", str(so)], capture_output=True, text=True).stdout
 sizes: dict[str, int] = {}
 current = None
