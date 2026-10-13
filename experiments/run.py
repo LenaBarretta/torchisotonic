@@ -133,6 +133,7 @@ TIME_PATTERNS = (
     "mono+16ulp",
     "mono+64ulp",
     "saw",
+    "cliff",
 )
 
 
@@ -148,6 +149,10 @@ def timing_data(name: str, batch: int, n: int) -> torch.Tensor:
         return bits.view(torch.float32).contiguous()
     if name == "saw":
         return (i % 7 + (i % 1500) * 0.1).expand(batch, n).contiguous()
+    if name == "cliff":  # increasing, then a last point far below: bridges across everything
+        y = consecutive_floats(n, torch.float32).cuda().expand(batch, n).contiguous()
+        y[:, -1] = -1e9
+        return y
     return torch.linspace(0, 3, n, device="cuda") + torch.randn(batch, n, device="cuda")
 
 

@@ -34,6 +34,11 @@ echo "waiting for the dataset to be ready..."
 until kaggle datasets status "$DATASET" 2>/dev/null | grep -qi ready; do sleep 5; done
 
 cp kaggle/kernel/kernel-metadata.json "$STAGE/kernel/"
+if [[ " $* " == *" example-ctr "* ]]; then  # the Criteo data for examples/ctr_calibration
+  python3 -c 'import json, sys; p = sys.argv[1]; m = json.load(open(p));
+m["dataset_sources"].append("mrkmakr/criteo-dataset"); json.dump(m, open(p, "w"), indent=2)' \
+    "$STAGE/kernel/kernel-metadata.json"
+fi
 steps=$(printf '"%s", ' "${@:-tests}")
 sed "s|^STEPS = .*|STEPS = [${steps%, }]|" kaggle/kernel/run.py > "$STAGE/kernel/run.py"  # | : steps may hold /
 kaggle kernels push -p "$STAGE/kernel" --accelerator NvidiaTeslaT4  # Kaggle's only GPU now

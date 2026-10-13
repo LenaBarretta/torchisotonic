@@ -48,6 +48,8 @@ image = (
     .apt_install("git")
     .pip_install("torch==2.11.0", index_url="https://download.pytorch.org/whl/cu128")
     .pip_install("numpy", "scipy", "scikit-learn", "pytest", "pytest-cov", "hypothesis", "ninja")
+    # torchsort's pyproject.toml does not load with setuptools 70 or later
+    .pip_install("setuptools<70", "wheel")
 )
 if modal.is_local():
     for name in tracked_files():

@@ -43,7 +43,6 @@ for (batch, n), warps in CASES:
         name = next((k for k in KERNELS if f"{k}_kernel" in event.key), "torch")
         times[name] += event.self_device_time_total / 1e3 / REPEATS
     total = sum(times.values())
-    ideal = 2 * batch * n * 4 / 320e9 * 1e3  # read y, write the fit, at 320 GB/s
     # What a plain copy of the input actually takes on this GPU: the practical bound.
     out = torch.empty_like(x)
     out.copy_(x)
@@ -56,7 +55,7 @@ for (batch, n), warps in CASES:
     end_e.synchronize()
     copy_ms = start_e.elapsed_time(end_e) / REPEATS
     parts = ", ".join(f"{k} {v:7.2f}" for k, v in sorted(times.items(), key=lambda kv: -kv[1]))
-    bounds = f"bandwidth bound {ideal:.2f}, copy {copy_ms:.2f}"
+    bounds = f"copy {copy_ms:.2f}"
     print(f"{batch}x{n}: total {total:7.2f} ms ({bounds}) | {parts}", flush=True)
     rounds = sorted(
         (e for e in prof.events() if "merge_kernel" in e.name and e.device_type.name == "CUDA"),

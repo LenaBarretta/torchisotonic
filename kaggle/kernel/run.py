@@ -110,14 +110,23 @@ if not failed and "experiments-each" in STEPS:
 for step in STEPS:  # variant:<name>: that variant alone, with the profile
     if not failed and step.startswith("variant:"):
         sh(f"cd {SRC} && timeout 600 python experiments/run.py --profile {step[8:]}")
+if not failed and "example-ctr" in STEPS:
+    # The Criteo data (mrkmakr/criteo-dataset), attached by push.sh for this step.
+    data = glob.glob("/kaggle/input/**/dac/train.txt", recursive=True)
+    if data:
+        script = "examples/ctr_calibration/calibrate.py"
+        sh(f"cd {SRC} && python {script} --data {data[0]} --out {OUT}/ctr")
+    else:
+        print("example-ctr: the Criteo dataset is not attached", flush=True)
 if not failed and "phases" in STEPS:
     sh(f"cd {SRC} && python bench/phases.py")
 for step in STEPS:  # phases:<dir>: the phases of another copy of the sources
     if not failed and step.startswith("phases:"):
         sh(f"cd {SRC} && python bench/phases.py --csrc {step[7:]}")
-if not failed and ("bench" in STEPS or "bench-quick" in STEPS):
-    quick = "--quick" if "bench-quick" in STEPS else ""
-    failed = sh(f"cd {SRC} && python bench/bench.py {quick}")
+if not failed and ("bench" in STEPS or "bench-quick" in STEPS or "bench-gpu" in STEPS):
+    flags = "--quick" if "bench-quick" in STEPS else "--gpu-only" if "bench-gpu" in STEPS else ""
+    failed = sh(f"cd {SRC} && python bench/bench.py {flags}")
+    sh(f"cat {SRC}/bench/results/*.md")
     sh(f"cp -r {SRC}/bench/results {OUT}/results")
 print(f"\n[{time.perf_counter() - START:6.0f}s] DONE, failed={failed}", flush=True)
 # Nothing left behind may keep the Kaggle session alive.

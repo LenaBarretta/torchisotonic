@@ -2,6 +2,8 @@
 
     python bench/bench.py            # full grid
     python bench/bench.py --quick    # small grid, to check that everything runs
+    python bench/bench.py --gpu-only # the GPU columns alone (a cloud container's CPU says
+                                     # nothing, and the scipy loop would take hours on it)
 
 Every implementation solves the same problems: a batch of decreasing, unweighted isotonic
 regressions (the only kind torchsort solves) of float32 data shaped [batch, n], noisy
@@ -59,13 +61,14 @@ def best_time(fn: Fn, sync: Callable[[], None], repeats: int) -> float:
     return min(times)
 
 
-def impls(data: np.ndarray, cuda: bool) -> dict[str, Fn]:
+def impls(data: np.ndarray, cuda: bool, gpu_only: bool = False) -> dict[str, Fn]:
     out: dict[str, Fn] = {}
     if cuda:
         x = torch.tensor(data, device="cuda")
         out["torchisotonic (cuda)"] = lambda: torchisotonic.isotonic(x, increasing=False)
     cpu = torch.tensor(data)
-    out["torchisotonic (cpu)"] = lambda: torchisotonic.isotonic(cpu, increasing=False)
+    if not gpu_only:
+        out["torchisotonic (cpu)"] = lambda: torchisotonic.isotonic(cpu, increasing=False)
     try:
         import torchsort.ops as ts
     except ImportError:
@@ -73,7 +76,10 @@ def impls(data: np.ndarray, cuda: bool) -> dict[str, Fn]:
     else:
         if cuda and data.size <= 10_000_000:  # beyond, a single call takes minutes
             out["torchsort (cuda)"] = lambda: ts.isotonic_l2["cuda"](x)
-        out["torchsort (cpu)"] = lambda: ts.isotonic_l2["cpu"](cpu)
+        if not gpu_only:
+            out["torchsort (cpu)"] = lambda: ts.isotonic_l2["cpu"](cpu)
+    if gpu_only:
+        return out
     from scipy.optimize import isotonic_regression
 
     def scipy_loop() -> object:
@@ -84,7 +90,10 @@ def impls(data: np.ndarray, cuda: bool) -> dict[str, Fn]:
 
 
 def run(
-    grid: list[tuple[int, int]], repeats: int, save: Callable[[list[dict[str, Any]]], None]
+    grid: list[tuple[int, int]],
+    repeats: int,
+    save: Callable[[list[dict[str, Any]]], None],
+    gpu_only: bool = False,
 ) -> list[dict[str, Any]]:
     cuda = torch.cuda.is_available()
     sync = torch.cuda.synchronize if cuda else (lambda: None)
@@ -93,7 +102,7 @@ def run(
         rng = np.random.default_rng(0)
         trend = np.linspace(0, 3, n, dtype=np.float32)
         data = (trend + rng.standard_normal((batch, n), dtype=np.float32))[:, ::-1].copy()
-        for name, fn in impls(data, cuda).items():
+        for name, fn in impls(data, cuda, gpu_only).items():
             row: dict[str, Any] = {"batch": batch, "n": n, "impl": name}
             try:
                 row["seconds"] = best_time(fn, sync, repeats)
@@ -132,6 +141,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--quick", action="store_true", help="small grid")
     parser.add_argument("--repeats", type=int, default=10)
+    parser.add_argument("--gpu-only", action="store_true", help="skip the CPU columns")
     args = parser.parse_args()
     if torch.cuda.is_available():
         device = torch.cuda.get_device_name(0)
@@ -149,7 +159,7 @@ def main() -> None:
         (RESULTS / f"{slug}.json").write_text(json.dumps({**meta, "rows": rows}, indent=1))
         (RESULTS / f"{slug}.md").write_text(markdown(rows, device))
 
-    run(QUICK if args.quick else FULL, args.repeats, save)
+    run(QUICK if args.quick else FULL, args.repeats, save, args.gpu_only)
     print(f"\nWrote {RESULTS / slug}.json and .md")
 
 
