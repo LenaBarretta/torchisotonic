@@ -54,11 +54,11 @@ explicit = true
 
 [tool.hatch.build.targets.sdist]
 # The sources, the tests (with docs/hull_prototype.py, which one of them checks), README and
-# licence. notes/ is kept out of git through .git/info/exclude, which hatch does not read, so it
-# is listed here too.
+# licence. notes/ and IDE settings are kept out of git through .git/info/exclude, which hatch
+# does not read, so they are listed here too.
 exclude = [
     "bench", "notebooks", "kaggle", "experiments", "examples", "cloud", ".github",
-    "notes", "uv.lock",
+    "notes", ".idea", ".vscode", "uv.lock",
 ]
 
 [tool.hatch.version]

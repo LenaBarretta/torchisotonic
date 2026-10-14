@@ -75,7 +75,7 @@ for batch, n in SHAPES:
         best_ms(lambda x=x, g=g: ours_grad(x, g)),
     ]
     text = [f"{c:,.2f}" for c in cells]
-    if ts is not None and batch * n <= 10_000_000:  # beyond, a single call takes minutes
+    if ts is not None and n <= 10_000_000:  # a row of 10^8 takes minutes on one thread
         fwd, bwd = ts.isotonic_l2["cuda"], ts.isotonic_l2_backward["cuda"]
         text.append(f"{best_ms(lambda x=x, fwd=fwd: fwd(x)):,.2f}")
         text.append(f"{best_ms(lambda x=x, g=g, f=fwd, b=bwd: b(x, f(x), g)):,.2f}")

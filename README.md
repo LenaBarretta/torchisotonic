@@ -8,6 +8,12 @@ data in weighted least squares. It is what `sklearn.isotonic.isotonic_regression
 every row of a tensor at once, on the CPU or with CUDA kernels on the GPU, from a few
 elements per row to a hundred million.
 
+It is useful wherever a monotone fit has to run often, on long data, or inside a model:
+calibrating classifier scores (what scikit-learn's `CalibratedClassifierCV(method="isotonic")`
+fits), many curves at once (one per segment, threshold or bootstrap sample), monotone
+constraints and differentiable sorting and ranking layers, where the fit and its gradient run
+at every training step.
+
 ```python
 import torch
 import torchisotonic
@@ -36,13 +42,14 @@ Rows of unequal length go in one batch padded at the end with a value above each
 of each row is exactly its own. Rows of very different lengths fit faster laid end to end in a single row,
 as [`examples/ctr_calibration`](examples/ctr_calibration) does.
 
-**Status: pre-alpha.** Not on PyPI yet; the API may change. The C++/CUDA code is compiled the
-first time it is used (about a minute), which needs `ninja`, a C++ compiler and, for the GPU,
-the CUDA toolkit:
+## Installation
 
 ```bash
-pip install git+https://github.com/LenaBarretta/torchisotonic
+pip install torchisotonic
 ```
+
+The C++/CUDA code is compiled the first time it is used (about a minute), which needs `ninja`,
+a C++ compiler and, for the GPU, the CUDA toolkit. **Status: alpha**; the API may still change.
 
 ## Performance
 
@@ -52,25 +59,23 @@ columns:
 
 | batch × n | torchisotonic (cuda) | `exact=False` | torchsort (cuda) | torchisotonic (cpu) | torchsort (cpu) | scipy, a loop over rows |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1,000,000 × 16 | **2.15** | 1.20 | — | 407 | 677 | 14,363 |
-| 100,000 × 128 | **1.66** | 1.29 | — | 280 | 492 | 1,613 |
-| 10,000 × 1,000 | **2.15** | 1.18 | 101 | 160 | 354 | 318 |
-| 1,000 × 10,000 | **1.70** | 1.15 | 197 | 160 | 358 | 178 |
-| 100 × 100,000 | **1.82** | 1.22 | 396 | 158 | 352 | 166 |
-| 10 × 1,000,000 | **1.94** | 1.35 | 1,654 | 157 | 357 | 170 |
-| 1 × 10,000,000 | **2.06** | 1.47 | 5,482 | 236 | 355 | 176 |
+| 1,000,000 × 16 | **2.16** | 1.21 | 72.0 | 407 | 677 | 14,363 |
+| 100,000 × 128 | **1.71** | 1.30 | 136 | 280 | 492 | 1,613 |
+| 10,000 × 1,000 | **2.29** | 1.22 | 99.2 | 160 | 354 | 318 |
+| 1,000 × 10,000 | **1.72** | 1.12 | 197 | 160 | 358 | 178 |
+| 100 × 100,000 | **1.82** | 1.23 | 396 | 158 | 352 | 166 |
+| 10 × 1,000,000 | **1.95** | 1.35 | 1,656 | 157 | 357 | 170 |
+| 1 × 10,000,000 | **2.07** | 1.47 | 5,493 | 236 | 355 | 176 |
 | 100 × 1,000 | **0.09** | 0.07 | 3.0 | 1.7 | 3.5 | 2.9 |
-| 10 × 10,000 | **0.21** | 0.20 | 14.0 | 1.7 | 3.5 | 1.6 |
-| 1 × 100,000 | **0.26** | 0.26 | 51.6 | 1.8 | 3.5 | 1.6 |
-| 1 × 1,000,000 | **0.50** | 0.44 | 548 | 17.9 | 35.0 | 15.5 |
-| 1 × 100,000,000 | **16.7** | 10.8 | — | 3,552 | — | — |
+| 10 × 10,000 | **0.22** | 0.20 | 14.0 | 1.7 | 3.5 | 1.6 |
+| 1 × 100,000 | **0.26** | 0.25 | 51.7 | 1.8 | 3.5 | 1.6 |
+| 1 × 1,000,000 | **0.51** | 0.44 | 550 | 17.9 | 35.0 | 15.5 |
+| 1 × 100,000,000 | **16.9** | 10.8 | — | 3,552 | — | — |
 
-torchsort (cuda) was not run with more than 10⁷ elements (a single call would take minutes);
-the CPU columns are on Kaggle's CPU, so they say how the libraries compare, not how fast a
-good CPU is. A plain copy of 10⁸ float32 elements on the T4 takes 3.4 ms: the GPU code is a few
-times above that, bound by the instructions the hull takes rather than by memory. On an L4 and
-an A100 one row of 10⁷ elements takes 1.2 and 0.8 ms, and 10⁸ elements 8.0 and 4.3 ms.
-`bench/bench.py` reproduces the table.
+torchsort solves each row with one GPU thread, so a long row is slow; it was not run on 10⁸
+elements. The CPU columns are on Kaggle's CPU, so they say how the libraries compare, not how
+fast a good CPU is. On an L4, an A100 and an H100 one row of 10⁷ elements takes 1.2, 0.8 and
+0.5 ms, and 10⁸ elements 8.2, 4.3 and 2.7 ms. `bench/bench.py` reproduces the table.
 
 ## How it works
 
@@ -97,7 +102,7 @@ uv run pytest
 ```
 
 The tests compare against scipy and scikit-learn (with hypothesis) and, on a machine with a
-GPU, the CUDA operator against the CPU one.
+GPU, the CUDA operator against the CPU one; without a GPU the CUDA tests are skipped.
 
 ## License
 
