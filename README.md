@@ -67,8 +67,8 @@ dose-response or survival curves that must not go the wrong way, or the projecti
 differentiable sorting and ranking.
 
 ```python
-q = model(x)                    # [batch, levels]: quantiles at increasing levels
-q = torchisotonic.isotonic(q)   # never crossing, with gradients
+q = model(x)  # [batch, levels]: quantiles at increasing levels
+q = torchisotonic.isotonic(q)  # never crossing, with gradients
 loss = pinball(q, target, levels)  # any quantile loss
 ```
 
