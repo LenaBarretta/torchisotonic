@@ -8,12 +8,6 @@ data in weighted least squares. It is what `sklearn.isotonic.isotonic_regression
 every row of a tensor at once, on the CPU or with CUDA kernels on the GPU, from a few
 elements per row to a hundred million.
 
-It is useful wherever a monotone fit has to run often, on long data, or inside a model:
-calibrating classifier scores (what scikit-learn's `CalibratedClassifierCV(method="isotonic")`
-fits), many curves at once (one per segment, threshold or bootstrap sample), monotone
-constraints and differentiable sorting and ranking layers, where the fit and its gradient run
-at every training step.
-
 ```python
 import torch
 import torchisotonic
@@ -24,6 +18,61 @@ fit = torchisotonic.isotonic(y)  # every row, non-decreasing
 w = torch.rand(1000, 5000, device="cuda") + 0.1
 fit = torchisotonic.isotonic(y, w, increasing=False, y_min=0.0, y_max=1.0)
 ```
+
+## What it is for
+
+Whenever a monotone fit has to run often, on long data, for many curves at once, or inside a
+model during training.
+
+**Calibrating a classifier.** A model's scores rank well but are not probabilities; isotonic
+regression maps each score to the rate of positives observed at that score, as scikit-learn's
+`IsotonicRegression` and `CalibratedClassifierCV(method="isotonic")` do. A curve over 6.5 million
+held-out scores takes 42 ms on a T4, against 2 s for scikit-learn. These two functions give
+scikit-learn's curve and predictions, equal scores pooled into their mean:
+
+```python
+def fit_calibration(scores, labels):
+    """The calibration curve, as scikit-learn's IsotonicRegression fits it."""
+    s, order = torch.sort(scores)
+    xs, inverse, counts = torch.unique_consecutive(s, return_inverse=True, return_counts=True)
+    sums = torch.zeros(len(xs), dtype=torch.float64, device=scores.device)
+    sums.index_add_(0, inverse, labels[order].double())
+    return xs, torchisotonic.isotonic(sums / counts, counts.double())
+
+
+def calibrate(new_scores, xs, fit):
+    """Calibrated probabilities: linear between the curve's points, constant beyond them."""
+    i = torch.searchsorted(xs, new_scores).clamp(1, len(xs) - 1)
+    t = ((new_scores - xs[i - 1]) / (xs[i] - xs[i - 1])).clamp(0, 1)
+    return fit[i - 1] + t * (fit[i] - fit[i - 1])
+```
+
+[`examples/ctr_calibration`](examples/ctr_calibration) calibrates a click model on 45.8
+million Criteo impressions this way, with one curve per segment for 280 segments in one call.
+
+**Many curves at once.** Every row of the input is its own problem, so a thousand curves cost
+little more than one: per segment, per threshold, or per bootstrap sample. For instance, a
+band of uncertainty around a calibration curve, from a Bayesian bootstrap of the labels `y`
+ordered by score:
+
+```python
+w = torch.empty(1000, len(y), device=y.device).exponential_()  # one resample per row
+curves = torchisotonic.isotonic(y.expand(1000, -1), w)
+low, high = curves.quantile(0.05, dim=0), curves.quantile(0.95, dim=0)
+```
+
+**Inside a model.** The fit is differentiable in `y` and in the weights, so it can enforce
+monotonicity in a network and train through it: predicted quantiles that never cross,
+dose-response or survival curves that must not go the wrong way, or the projection step of
+differentiable sorting and ranking.
+
+```python
+q = model(x)                    # [batch, levels]: quantiles at increasing levels
+q = torchisotonic.isotonic(q)   # never crossing, with gradients
+loss = pinball(q, target, levels)  # any quantile loss
+```
+
+## Semantics
 
 The semantics are scikit-learn's: weights must be strictly positive (a weight of the shape of
 `y`, or one that broadcasts to it), the result is clipped to `[y_min, y_max]` if they are
