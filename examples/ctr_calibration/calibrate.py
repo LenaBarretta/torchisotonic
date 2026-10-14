@@ -382,13 +382,23 @@ def main() -> None:
                 out[b] = fit.predict(test_np[b])
         return out
 
+    # For the timing, the fits alone, as per_segment_fit: each segment's rows gathered first.
+    order = np.argsort(seg_cal, kind="stable")
+    bounds = np.searchsorted(seg_cal[order], np.arange(k + 1))
+    groups = [order[bounds[g] : bounds[g + 1]] for g in range(k)]
+    seg_x, seg_y = [cal_np[i] for i in groups], [cal_y_np[i] for i in groups]
+
+    def sklearn_per_segment_fit() -> None:
+        for x, y in zip(seg_x, seg_y, strict=True):
+            IsotonicRegression(out_of_bounds="clip").fit(x, y)
+
     sk_seg = sklearn_per_segment()
     res["per_segment_isotonic"] = {
         "feature": CATS[field],
         "segments": int(k),
         "rows_in_segments": int(in_cal.sum()),
         "max_diff_vs_sklearn": float(np.abs(sk_seg - per_seg.cpu().numpy()).max()),
-        "sklearn_seconds": best_time(sklearn_per_segment, repeats=1),
+        "sklearn_seconds": best_time(sklearn_per_segment_fit, repeats=1),
         "torchisotonic_seconds": best_time(per_segment_fit),
     }
     log("per-segment isotonic:", res["per_segment_isotonic"])

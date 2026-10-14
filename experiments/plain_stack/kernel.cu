@@ -75,7 +75,7 @@ __device__ uint32_t plain_chain(
 
 // chunk_kernel, with plain_chain for lane_chain.
 template <typename scalar_t, bool W, int WARPS>
-__global__ void __launch_bounds__(WARPS * kLanes) ablate_kernel(
+__global__ void __launch_bounds__(WARPS * kLanes) stack_chunk_kernel(
     const scalar_t* __restrict__ y,
     const scalar_t* __restrict__ w,
     int64_t n,
@@ -419,8 +419,8 @@ at::Tensor isotonic(const at::Tensor& y, const c10::optional<at::Tensor>& w, boo
             y, W ? &*w : nullptr, increasing, out,
             [&](int64_t chunks, int64_t nn, int64_t per_row, scalar_t sign, scalar_t* o,
                 Hulls h, cudaStream_t stream) {
-              carve<scalar_t, W>(ablate_kernel<scalar_t, W, warps>);
-              ablate_kernel<scalar_t, W, warps><<<chunks, warps * kLanes, 0, stream>>>(
+              carve<scalar_t, W>(stack_chunk_kernel<scalar_t, W, warps>);
+              stack_chunk_kernel<scalar_t, W, warps><<<chunks, warps * kLanes, 0, stream>>>(
                   yp, wp, nn, per_row, sign, o, h);
             });
       };

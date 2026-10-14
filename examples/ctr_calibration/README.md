@@ -55,20 +55,22 @@ The analytic correction undoes the downsampling only on average; a monotone curv
 the data removes the rest, and does better than Platt scaling: by 5.0e-4 in log-loss over day 7
 (95% interval 4.7e-4 to 5.3e-4, paired over the rows). Per segment (the 280 values of C15 with
 at least 5,000 rows on day 6, 60% of the traffic), one curve per segment lowers the log-loss of
-those rows from 0.4764 to 0.4752, by 1.24e-3 (95% interval 1.07e-3 to 1.42e-3).
+those rows from 0.4764 to 0.4752, by 1.24e-3 (95% interval 1.07e-3 to 1.42e-3), while its
+expected calibration error on them is slightly higher, 0.0026 against 0.0023: 280 curves fitted
+on fewer rows each are noisier, but they sort the rows better.
 
 ![Reliability diagram on day 7](reliability.png)
 
 The isotonic fits agree with scikit-learn's to 6e-16 (one curve) and 7e-10 (per segment, where
-scores are keyed as segment + score in float64). The GPU times include sorting the scores and
-pooling equal ones; "from host memory" also copies the scores and labels to the GPU first, as
-scikit-learn's start there:
+scores are keyed as segment + score in float64). Both sides are timed on the fits alone. The
+GPU times include sorting the scores and pooling equal ones; "from host memory" also copies the
+scores and labels to the GPU first, as scikit-learn's start there:
 
 | fit | scores | scikit-learn (CPU) | torchisotonic (GPU) | from host memory |
 | --- | ---: | ---: | ---: | ---: |
-| one curve, day 6 | 6,548,660 | 1.94 s | 0.038 s | 0.057 s |
-| 280 curves, day 6 | 3,950,507 | 7.28 s | 0.033 s | - |
-| one curve | 100,000 | 0.023 s | 0.0008 s | 0.0014 s |
-| one curve | 1,000,000 | 0.24 s | 0.0044 s | 0.0078 s |
-| one curve | 10,000,000 | 3.16 s | 0.038 s | 0.071 s |
-| one curve, all days | 45,840,617 | 16.8 s | 0.155 s | 0.310 s |
+| one curve, day 6 | 6,548,660 | 2.02 s | 0.042 s | 0.050 s |
+| 280 curves, day 6 | 3,950,507 | 0.77 s | 0.033 s | - |
+| one curve | 100,000 | 0.021 s | 0.0009 s | 0.0014 s |
+| one curve | 1,000,000 | 0.23 s | 0.0044 s | 0.0080 s |
+| one curve | 10,000,000 | 3.30 s | 0.038 s | 0.072 s |
+| one curve, all days | 45,840,617 | 17.2 s | 0.155 s | 0.309 s |

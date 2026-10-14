@@ -44,7 +44,8 @@ RESULTS = Path(__file__).parent / "results"
 Fn = Callable[[], object]
 
 
-def best_time(fn: Fn, sync: Callable[[], None], repeats: int) -> float:
+def call_times(fn: Fn, sync: Callable[[], None], repeats: int) -> list[float]:
+    """Seconds per call, over up to `repeats` calls after a warm-up."""
     fn()  # warm-up; also compiles the operators
     sync()
     if torch.cuda.is_available():
@@ -60,7 +61,7 @@ def best_time(fn: Fn, sync: Callable[[], None], repeats: int) -> float:
         times.append(time.perf_counter() - start)
         if sum(times) > 10:  # slow enough that these runs say it
             break
-    return min(times)
+    return times
 
 
 def impls(data: np.ndarray, cuda: bool, gpu_only: bool = False) -> dict[str, Fn]:
@@ -79,7 +80,7 @@ def impls(data: np.ndarray, cuda: bool, gpu_only: bool = False) -> dict[str, Fn]
     except ImportError:
         pass
     else:
-        if cuda and data.size <= 10_000_000:  # beyond, a single call takes minutes
+        if cuda and data.shape[1] <= 10_000_000:  # a row of 10^8 takes minutes on one thread
             out["torchsort (cuda)"] = lambda: ts.isotonic_l2["cuda"](x)
         if not gpu_only:
             out["torchsort (cpu)"] = lambda: ts.isotonic_l2["cpu"](cpu)
@@ -110,7 +111,10 @@ def run(
         for name, fn in impls(data, cuda, gpu_only).items():
             row: dict[str, Any] = {"batch": batch, "n": n, "impl": name}
             try:
-                row["seconds"] = best_time(fn, sync, repeats)
+                times = np.array(call_times(fn, sync, repeats))
+                row["seconds"] = float(times.min())
+                row["median"] = float(np.median(times))
+                row["quartiles"] = [float(q) for q in np.percentile(times, [25, 75])]
             except torch.cuda.OutOfMemoryError:
                 row["error"] = "out of memory"
             except (RuntimeError, MemoryError) as e:

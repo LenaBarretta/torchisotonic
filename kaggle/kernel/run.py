@@ -115,6 +115,9 @@ if not failed and "experiments-each" in STEPS:
     for folder in sorted(glob.glob(f"{SRC}/experiments/*/kernel.cu")):
         name = os.path.basename(os.path.dirname(folder))
         sh(f"cd {SRC} && timeout 600 python experiments/run.py --profile {name}")
+for step in STEPS:  # py:<script>: a script of the tree, run from its root
+    if not failed and step.startswith("py:"):
+        sh(f"cd {SRC} && python {step[3:]}")
 for step in STEPS:  # variant:<name>: that variant alone, with the profile
     if not failed and step.startswith("variant:"):
         sh(f"cd {SRC} && timeout 600 python experiments/run.py --profile {step[8:]}")
