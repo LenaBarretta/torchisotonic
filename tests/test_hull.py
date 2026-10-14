@@ -6,6 +6,7 @@ import math
 from collections.abc import Iterator
 
 import numpy as np
+import numpy.typing as npt
 import pytest
 import torch
 from hypothesis import HealthCheck, given, settings
@@ -14,6 +15,8 @@ from scipy.optimize import isotonic_regression
 
 import torchisotonic
 from torchisotonic import _api
+
+Array = npt.NDArray[np.float64]
 
 values = st.integers(-20, 20).map(float) | st.floats(-1e3, 1e3, allow_nan=False)
 
@@ -27,7 +30,7 @@ def hull(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Ite
     yield request.param
 
 
-def reference(y: np.ndarray, w: np.ndarray | None, increasing: bool = True) -> torch.Tensor:
+def reference(y: Array, w: Array | None, increasing: bool = True) -> torch.Tensor:
     return torch.tensor(isotonic_regression(y, weights=w, increasing=increasing).x.copy())
 
 
@@ -42,7 +45,7 @@ def reference(y: np.ndarray, w: np.ndarray | None, increasing: bool = True) -> t
 )
 def test_matches_scipy(hull: int, y: list[float], weighted: bool, increasing: bool) -> None:
     yy = np.array(y)
-    w = np.linspace(0.5, 2.0, len(y)) if weighted else None
+    w = np.linspace(0.5, 2.0, len(y), dtype=np.float64) if weighted else None
     got = torchisotonic.isotonic(
         torch.tensor(yy), None if w is None else torch.tensor(w), increasing=increasing
     )

@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import numpy.typing as npt
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from scipy.optimize import isotonic_regression
@@ -13,11 +14,13 @@ from scipy.optimize import isotonic_regression
 sys.path.insert(0, str(Path(__file__).parents[1] / "docs"))
 import hull_prototype
 
+Array = npt.NDArray[np.float64]
+
 values = st.integers(-20, 20).map(float) | st.floats(-1e3, 1e3, allow_nan=False)
 
 
 @st.composite
-def problems(draw: st.DrawFn) -> tuple[np.ndarray, np.ndarray | None, int]:
+def problems(draw: st.DrawFn) -> tuple[Array, Array | None, int]:
     y = np.array(draw(st.lists(values, max_size=80)), dtype=np.float64)
     w = draw(st.none() | st.lists(st.floats(0.01, 100), min_size=len(y), max_size=len(y)))
     chunk = draw(st.sampled_from([1, 2, 3, 4, 7, 16, 100]))
@@ -26,7 +29,7 @@ def problems(draw: st.DrawFn) -> tuple[np.ndarray, np.ndarray | None, int]:
 
 @settings(max_examples=2000, deadline=None)
 @given(problem=problems())
-def test_matches_scipy(problem: tuple[np.ndarray, np.ndarray | None, int]) -> None:
+def test_matches_scipy(problem: tuple[Array, Array | None, int]) -> None:
     y, w, chunk = problem
     want = isotonic_regression(y, weights=w).x
     got = hull_prototype.isotonic(y, w, chunk=chunk)

@@ -30,11 +30,13 @@ from __future__ import annotations
 import itertools
 
 import numpy as np
+import numpy.typing as npt
 
+Array = npt.NDArray[np.float64]
 Hull = list[int]  # indices k of the points P_k on a lower hull, increasing
 
 
-def chunk_hull(w: np.ndarray, y: np.ndarray, lo: int, hi: int) -> Hull:
+def chunk_hull(w: Array, y: Array, lo: int, hi: int) -> Hull:
     """PAVA on elements lo..hi-1; returns its hull as point indices lo..hi."""
     starts: list[int] = []
     weights: list[float] = []
@@ -51,11 +53,11 @@ def chunk_hull(w: np.ndarray, y: np.ndarray, lo: int, hi: int) -> Hull:
     return [*starts, hi]
 
 
-def slope(xs: np.ndarray, ys: np.ndarray, a: int, b: int) -> float:
+def slope(xs: Array, ys: Array, a: int, b: int) -> float:
     return float((ys[b] - ys[a]) / (xs[b] - xs[a]))
 
 
-def tangent(xs: np.ndarray, ys: np.ndarray, p: int, right: Hull) -> int:
+def tangent(xs: Array, ys: Array, p: int, right: Hull) -> int:
     """Position in ``right`` of the vertex where the lower tangent from point p touches."""
     lo, hi = 0, len(right) - 1
     while lo < hi:  # slopes from p fall then rise along the right hull: find the minimum
@@ -67,7 +69,7 @@ def tangent(xs: np.ndarray, ys: np.ndarray, p: int, right: Hull) -> int:
     return lo
 
 
-def merge(xs: np.ndarray, ys: np.ndarray, left: Hull, right: Hull) -> Hull:
+def merge(xs: Array, ys: Array, left: Hull, right: Hull) -> Hull:
     """Lower hull of two neighbouring lower hulls (left[-1] == right[0])."""
     assert left[-1] == right[0]
     if len(left) == 1 or len(right) == 1:
@@ -91,7 +93,7 @@ def merge(xs: np.ndarray, ys: np.ndarray, left: Hull, right: Hull) -> Hull:
     return left[: best + 1] + right[best_b:]
 
 
-def isotonic(y: np.ndarray, w: np.ndarray | None = None, chunk: int = 4) -> np.ndarray:
+def isotonic(y: Array, w: Array | None = None, chunk: int = 4) -> Array:
     """Increasing isotonic regression of y, computed the parallel way."""
     n = len(y)
     if n == 0:
