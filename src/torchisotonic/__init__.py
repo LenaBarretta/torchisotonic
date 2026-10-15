@@ -3,4 +3,4 @@
 from torchisotonic._api import isotonic
 
 __all__ = ["isotonic"]
-__version__ = "0.1.0"
+__version__ = "0.1.1"

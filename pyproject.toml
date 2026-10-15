@@ -79,5 +79,5 @@ files = ["src", "tests", "docs"]
 mypy_path = "docs"
 
 [[tool.mypy.overrides]]
-module = ["scipy", "scipy.*", "sklearn", "sklearn.*"]
+module = ["scipy", "scipy.*", "sklearn", "sklearn.*", "ninja"]
 ignore_missing_imports = true

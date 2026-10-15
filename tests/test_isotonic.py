@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import os
+import shutil
 
 import numpy as np
 import pytest
@@ -161,3 +163,15 @@ def test_bad_inputs() -> None:
         torchisotonic.isotonic(torch.zeros(3), torch.ones(4))
     with pytest.raises(ValueError, match="strictly positive"):
         torchisotonic.isotonic(torch.zeros(3), torch.tensor([1.0, 0.0, 1.0]))
+
+
+def test_ninja_found_without_an_activated_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    # torch's builder runs ninja from PATH; the package's own ninja must be on it.
+    import ninja
+
+    from torchisotonic import _ext
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setenv("PATH", "/nowhere")
+    _ext._ninja_on_path()
+    assert os.environ["PATH"].split(os.pathsep)[0] == ninja.BIN_DIR

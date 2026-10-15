@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import functools
+import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -35,9 +37,20 @@ def isotonic_grad(
     return grads
 
 
+def _ninja_on_path() -> None:
+    """Puts the ninja that came with the package on PATH, for torch's builder, which runs it
+    from PATH: a Python started from an environment that is not activated (a notebook kernel,
+    an IDE, ``.venv/bin/python``) would not find it."""
+    if shutil.which("ninja") is None:
+        import ninja
+
+        os.environ["PATH"] = ninja.BIN_DIR + os.pathsep + os.environ.get("PATH", "")
+
+
 @functools.cache
 def _load() -> Any:
     """``torch.ops.torchisotonic``, compiled for this machine (and its GPU, if any) once."""
+    _ninja_on_path()
     sources = [CSRC / "ops.cpp"]
     if torch.cuda.is_available() and cpp_extension.CUDA_HOME is not None:  # pragma: no cover
         sources += [CSRC / "ops_tiles.cu"]
