@@ -1,6 +1,15 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/LenaBarretta/torchisotonic/main/docs/logo.png" alt="torchisotonic logo" width="160">
+</p>
+
 # torchisotonic
 
-Batched isotonic regression for PyTorch tensors, fast on the GPU.
+[![PyPI](https://img.shields.io/pypi/v/torchisotonic)](https://pypi.org/project/torchisotonic/)
+[![Python](https://img.shields.io/pypi/pyversions/torchisotonic)](https://pypi.org/project/torchisotonic/)
+[![CI](https://github.com/LenaBarretta/torchisotonic/actions/workflows/ci.yml/badge.svg)](https://github.com/LenaBarretta/torchisotonic/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+**Batched isotonic regression for PyTorch tensors, fast on the GPU.**
 
 Isotonic regression finds the non-decreasing (or non-increasing) sequence closest to the
 data in weighted least squares. It is what `sklearn.isotonic.isotonic_regression` and
