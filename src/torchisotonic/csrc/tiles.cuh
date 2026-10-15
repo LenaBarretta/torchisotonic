@@ -369,11 +369,13 @@ __device__ __forceinline__ int next_vertex(const C& c, int p, int t1, int end) {
 }
 
 // A point in chunk coordinates, each as an unevaluated sum hi + lo: loaded once, then every
-// turn it takes part in needs no shared memory.
+// turn it takes part in needs no shared memory. ym bounds the ordinate's two terms, the lane's
+// start and the sum within the lane: |start| + |sum|, which may far exceed |yh| when they cancel.
 template <typename acc_t>
 struct Point2 {
   int p;
   acc_t yh, yl, xh, xl;  // x: weighted only
+  acc_t ym;
 };
 
 template <typename C>
@@ -388,6 +390,7 @@ __device__ __forceinline__ Point2<typename C::acc> chunk_point(const C& c, int p
   two_sum(c.by[0][t], ly, s, e);
   q.yh = s;
   q.yl = e + c.by[1][t] + (C::kPairs && inside ? unpack_lo(ly, c.syl[pad(p - 1)]) : acc_t(0));
+  q.ym = fabs(c.by[0][t]) + fabs(ly);
   if (C::kW) {
     const acc_t lx = inside ? c.sx[pad(p - 1)] : acc_t(0);
     two_sum(c.bx[0][t], lx, s, e);
@@ -442,9 +445,11 @@ __device__ __forceinline__ acc_t turn2(
     x2 = to_acc<acc_t>(d.p - a.p);
   }
   const acc_t p1 = x1 * y2, p2 = y1 * x2, c = p1 - p2;
-  // A coordinate here is a lane start's hi plus a lane sum's hi, rounded: within 3 u M rather
-  // than u M, so the magnitude terms take three times lane_chain's coefficient.
-  const acc_t my = fmax(fmax(fabs(a.yh), fabs(b.yh)), fabs(d.yh));
+  // A coordinate here is a lane start's hi plus a lane sum's hi, rounded, its lo part dropped:
+  // within u (|yh| + |start| + |sum|) <= 2 u ym of the pair, ym = |start| + |sum| (Point2), so
+  // the magnitude terms take three times lane_chain's coefficient on the largest ym. Abscissae
+  // are sums of positive weights, which do not cancel: |xh| bounds their terms.
+  const acc_t my = fmax(fmax(a.ym, b.ym), d.ym);
   acc_t bound = fma(3 * bound_m<acc_t>() * my, fabs(x1) + fabs(x2),
                     bound_p<acc_t>() * (fabs(p1) + fabs(p2)));
   if (W) {
@@ -999,12 +1004,13 @@ __global__ void __launch_bounds__(WARPS * kLanes) packed_kernel(
   auto load = [&](int p) {  // point p of this lane's problem, in the problem's coordinates
     Point2<acc_t> pt;
     pt.p = p;
-    pt.yh = pt.yl = pt.xh = pt.xl = acc_t(0);
+    pt.yh = pt.yl = pt.xh = pt.xl = pt.ym = acc_t(0);
     if (p != first_point) {
       const int e = p - 1, t = e / kLanes;
       acc_t s, err;
       two_sum(c.by[0][t], c.sy[pad(e)], s, err);
       pt.yh = s;
+      pt.ym = fabs(c.by[0][t]) + fabs(c.sy[pad(e)]);
       pt.yl = err + c.by[1][t] + (C::kPairs ? unpack_lo(c.sy[pad(e)], c.syl[pad(e)]) : acc_t(0));
       if (W) {
         two_sum(c.bx[0][t], c.sx[pad(e)], s, err);
@@ -1146,23 +1152,28 @@ struct Row {  // one problem's vertices, in its coordinates
   // filtered result is returned as it is.
   //
   // The bound costs no floating-point operation (the merges are bound by double
-  // throughput): it is compared by exponents. With u = 2^-53 the error is below
-  // 8u (M (|bx| + |by| + |dx| + |dy|) + |p1| + |p2|) <= 16u M (|bx| + |by| + |dx| + |dy|) for
-  // M the largest coordinate, as |p1| + |p2| <= M (|bx| + |by|). Bounding each factor by a
-  // power of two from its exponent - M <= 2^(E_m + 1) with E_m <= max(E_a, E_e) + 1 over a's
-  // coordinates and the four differences, the sum of the differences by 2^(E_e + 3) - gives
-  // a bound of at most 2^(E_m + E_e - 45), while |c| >= 2^E_c for a normal c. The derivation
-  // assumes normal numbers, so a zero or subnormal c or difference always takes the slow
-  // path. That path is double arithmetic too, not exact: its rounding is at the scale of the
-  // chunks' sums rather than the problem's.
+  // throughput): it is compared by exponents. An absolute coordinate drops the lo part of its
+  // chunk's start and rounds a sum, so it is within u (|start| + |coordinate|) <= 2 u M of the
+  // represented point, for u = 2^-53 and M at least every coordinate and every chunk start of
+  // the three points (the ordinates' chunk starts may exceed the coordinates when the sums
+  // cancel; the abscissae's never do). The error of c is then below
+  // 8u (M (|bx| + |by| + |dx| + |dy|) + |p1| + |p2|). With E_s the largest exponent of the
+  // ordinates' chunk starts, E_e that of the four differences and E_m = max(E_a, E_e, E_s) + 1
+  // over a's coordinates too: M < 2^(E_m + 1), the differences sum to below 2^(E_e + 3), and
+  // |p1| + |p2| < 2^(E_e + 1) (|bx| + |by|) <= 2^(E_m) (...), so the error is below
+  // 2^(E_m + E_e - 45), while |c| >= 2^E_c for a normal c. The derivation assumes normal
+  // numbers, so a zero or subnormal c or difference always takes the slow path. That path is
+  // double arithmetic too, not exact: its rounding is at the scale of the chunks' sums rather
+  // than the problem's.
   __device__ __forceinline__ double turn(
       const Pt& a, const Pt& b, const Pt& d, const Seg* A, int as, int ap, const Seg* B, int bs,
       int bp, const Seg* D, int ds, int dp) const {
     const double bx = b.x - a.x, by = b.y - a.y, dx = d.x - a.x, dy = d.y - a.y;
     const double p1 = bx * dy, p2 = by * dx, c = p1 - p2;
     const int ea = imax(bexp(a.x), bexp(a.y));
+    const int es = imax(imax(bexp(cy[A[as].chunk]), bexp(cy[B[bs].chunk])), bexp(cy[D[ds].chunk]));
     const int ee = imax(imax(bexp(bx), bexp(by)), imax(bexp(dx), bexp(dy)));
-    const int em = imax(ea, ee) + 1;
+    const int em = imax(imax(ea, es), ee) + 1;
     const int ec = bexp(c);
     // Biased exponents: E = e - 1023, so the condition E_c >= E_m + E_e - 44 reads
     // e_c >= e_m + e_e - 1067.

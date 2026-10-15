@@ -89,11 +89,13 @@ given, `dim` picks the axis, and a row holding a NaN comes back as NaN. Float in
 dtype (float16 and bfloat16 are computed in float32), integer input becomes the default
 float dtype. The fit is differentiable in `y` and in the weights.
 
-On the GPU, float32 is accurate to the format's rounding by default; the rounded fit is not
-guaranteed to be monotone, but no step down has turned up on any input we tested. `exact=False` makes it about 1.5–2 times faster on short and medium rows, at the cost of
-accuracy on hard inputs (strongly varying weights, increments near float32's resolution): errors
-of a few parts in a thousand, and steps down of up to about 1e-3 of the data's scale; float64
-is unaffected.
+On the GPU, float32 is accurate to the format's rounding by default. The fit is monotone up to
+rounding: where large values of both signs cancel in the cumulative sums, neighbouring float64
+values can step down by a few units in the last place of the data's scale. `exact=False`
+makes float32 about 1.5–2 times faster on short and medium rows, at the cost of accuracy on
+hard inputs (strongly varying weights, increments near float32's resolution): errors of a few
+parts in a thousand, and steps down of up to about 1e-3 of the data's scale; float64 is
+unaffected.
 
 Rows of unequal length go in one batch padded at the end with a value above each row's maximum
 (below its minimum for `increasing=False`): the padding never pools with the data, so the fit

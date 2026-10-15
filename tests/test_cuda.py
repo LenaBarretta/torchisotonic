@@ -240,6 +240,31 @@ def test_float32_fit_is_monotone(name: str, n: int) -> None:  # pragma: no cover
         assert bool((fit[1:] >= fit[:-1]).all())
 
 
+@pytest.mark.parametrize("big", [1e3, 1e6, 1e12])
+@pytest.mark.parametrize("n", [500, 3000, 100_000])  # packed, one chunk, merged chunks
+def test_cancelling_sums(n: int, big: float) -> None:  # pragma: no cover
+    # Per 64 elements: 32 of +big, one of -32 big, then small near-collinear values. The sums
+    # leap and fall back within every lane pair and chunk, so a coordinate is the difference of
+    # terms far larger than itself, which the predicates' error bounds must account for.
+    # float32 stays monotone. float64 slopes are differences of sums of up to 32 big, so
+    # neighbouring ones may cross by a few units in the last place of the data's scale.
+    g = torch.Generator().manual_seed(n)
+    k = torch.arange(n) % 64
+    y = torch.where(k < 32, big, 1.0).double()
+    y[k == 32] = -32 * big
+    y += 1e-3 * (-1.0) ** k * (k > 32) + 1e-6 * torch.randn(n, generator=g, dtype=torch.float64)
+    for w in (None, torch.rand(n, generator=g, dtype=torch.float64) + 0.1):
+        for dtype, step, dev in ((torch.float64, 8 * 2.0**-52, 1e-14), (torch.float32, 0, 1e-7)):
+            yy = y.to(dtype)[None]
+            ww = None if w is None else w.to(dtype)[None]
+            want = torchisotonic.isotonic(yy.double(), None if ww is None else ww.double())
+            got = torchisotonic.isotonic(yy.cuda(), None if ww is None else ww.cuda())
+            got = got.double().cpu()
+            scale = float(yy.double().abs().max())
+            assert float((got[:, :-1] - got[:, 1:]).max()) <= step * scale
+            torch.testing.assert_close(got, want, rtol=0, atol=dev * scale)
+
+
 @pytest.mark.parametrize("n", [500, 3000, 100_000])  # packed, one chunk, merged chunks
 def test_gradient_blocks_from_the_hull(n: int) -> None:  # pragma: no cover
     # Blocks (1 + u, 1, ..., 1) of s elements, u the float32 spacing at 1, s falling from S
