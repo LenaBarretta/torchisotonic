@@ -114,28 +114,28 @@ a C++ compiler and, for the GPU, the CUDA toolkit. **Status: alpha**; the API ma
 ## Performance
 
 On an NVIDIA T4 (Kaggle), float32, unweighted, decreasing fits of data noisy around a trend,
-in milliseconds; best of ten calls on a warmed-up GPU, data already on the device for the GPU
+in milliseconds; median of ten calls on a warmed-up GPU, data already on the device for the GPU
 columns:
 
 | batch × n | torchisotonic (cuda) | `exact=False` | torchsort (cuda) | torchisotonic (cpu) | torchsort (cpu) | scipy, a loop over rows |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1,000,000 × 16 | **2.16** | 1.21 | 72.0 | 407 | 677 | 14,363 |
-| 100,000 × 128 | **1.71** | 1.30 | 136 | 280 | 492 | 1,613 |
-| 10,000 × 1,000 | **2.29** | 1.22 | 99.2 | 160 | 354 | 318 |
-| 1,000 × 10,000 | **1.72** | 1.12 | 197 | 160 | 358 | 178 |
-| 100 × 100,000 | **1.82** | 1.23 | 396 | 158 | 352 | 166 |
-| 10 × 1,000,000 | **1.95** | 1.35 | 1,656 | 157 | 357 | 170 |
-| 1 × 10,000,000 | **2.07** | 1.47 | 5,493 | 236 | 355 | 176 |
-| 100 × 1,000 | **0.09** | 0.07 | 3.0 | 1.7 | 3.5 | 2.9 |
-| 10 × 10,000 | **0.22** | 0.20 | 14.0 | 1.7 | 3.5 | 1.6 |
-| 1 × 100,000 | **0.26** | 0.25 | 51.7 | 1.8 | 3.5 | 1.6 |
-| 1 × 1,000,000 | **0.51** | 0.44 | 550 | 17.9 | 35.0 | 15.5 |
-| 1 × 100,000,000 | **16.9** | 10.8 | — | 3,552 | — | — |
+| 1,000,000 × 16 | **2.17** | 1.23 | 73.1 | 380 | 652 | 13,512 |
+| 100,000 × 128 | **1.79** | 1.32 | 135 | 221 | 450 | 1,525 |
+| 10,000 × 1,000 | **2.29** | 1.29 | 101 | 147 | 341 | 305 |
+| 1,000 × 10,000 | **1.76** | 1.16 | 196 | 148 | 342 | 167 |
+| 100 × 100,000 | **1.90** | 1.25 | 395 | 142 | 370 | 161 |
+| 10 × 1,000,000 | **1.98** | 1.38 | 1,656 | 145 | 340 | 164 |
+| 1 × 10,000,000 | **2.13** | 1.51 | 5,494 | 223 | 332 | 171 |
+| 100 × 1,000 | **0.12** | 0.10 | 3.04 | 1.64 | 3.50 | 2.71 |
+| 10 × 10,000 | **0.24** | 0.22 | 14.0 | 1.62 | 3.32 | 1.64 |
+| 1 × 100,000 | **0.28** | 0.27 | 51.3 | 1.62 | 3.46 | 1.59 |
+| 1 × 1,000,000 | **0.52** | 0.46 | 545 | 15.8 | 33.9 | 15.3 |
+| 1 × 100,000,000 | **18.7** | 12.5 | — | 3,325 | — | — |
 
 torchsort solves each row with one GPU thread, so a long row is slow; it was not run on 10⁸
 elements. The CPU columns are on Kaggle's CPU, so they say how the libraries compare, not how
 fast a good CPU is. On an L4, an A100 and an H100 one row of 10⁷ elements takes 1.2, 0.8 and
-0.5 ms, and 10⁸ elements 8.2, 4.3 and 2.7 ms. `bench/bench.py` reproduces the table.
+0.6 ms, and 10⁸ elements 8.4, 4.3 and 2.7 ms. `bench/bench.py` reproduces the table.
 
 ## How it works
 
