@@ -10,7 +10,6 @@ import torch
 from test_grad import close_values
 
 import torchisotonic
-from torchisotonic import _api
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -62,53 +61,12 @@ def test_other_dims_and_low_precision() -> None:  # pragma: no cover
     both(y.bfloat16(), dim=1)
 
 
-@pytest.fixture
-def chunk_hull(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The older chunked-hull CUDA path instead of the tile pipeline."""
-    monkeypatch.setattr(_api, "CUDA_METHOD", "hull")
-
-
-@pytest.mark.parametrize("chunk", [1, 3, 32, 33, 128, 129, 512])  # every stack size
-@pytest.mark.parametrize(("batch", "n"), [(1, 1), (1, 2), (3, 1000), (2, 50_000), (40, 5000)])
-@pytest.mark.usefixtures("chunk_hull")
-def test_hull_matches_cpu(
-    chunk: int, batch: int, n: int, monkeypatch: pytest.MonkeyPatch
-) -> None:  # pragma: no cover
-    monkeypatch.setattr(_api, "HULL_MIN_N", 0)
-    monkeypatch.setattr(_api, "HULL_CHUNK", chunk)
-    g = torch.Generator().manual_seed(chunk * 7 + n)
-    y = torch.linspace(0, 3, n, dtype=torch.float64) + torch.randn(
-        batch, n, generator=g, dtype=torch.float64
-    )
-    w = torch.rand(batch, n, generator=g, dtype=torch.float64) + 0.1
-    # The hull's slopes are differences of cumulative sums, so it rounds differently from
-    # the PAVA it is compared with here: the same tolerance as against scipy on the CPU.
-    both(y, tol=1e-9)
-    both(y, w, tol=1e-9, increasing=False)
-
-
-@pytest.mark.usefixtures("chunk_hull")
-def test_hull_float32(monkeypatch: pytest.MonkeyPatch) -> None:  # pragma: no cover
-    # float32 input: the chunks' hulls are computed in float32 on the GPU, in float64 on the CPU.
-    monkeypatch.setattr(_api, "HULL_MIN_N", 0)
-    g = torch.Generator().manual_seed(3)
-    y = torch.linspace(0, 3, 200_000) + torch.randn(3, 200_000, generator=g)
-    both(y, tol=1e-4)
-
-
-@pytest.fixture
-def tiles_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The tile pipeline for every length, short problems included."""
-    monkeypatch.setattr(_api, "TILES_MIN_N", 0)
-
-
 TILE_SHAPES = [1, 2, 31, 32, 33, 64, 100, 128, 255, 511, 512, 1000, 1023, 1024, 1025, 2048]
 TILE_SHAPES += [4095, 4096, 4097, 8193, 100_000]
 
 
 @pytest.mark.parametrize("n", TILE_SHAPES)
 @pytest.mark.parametrize("batch", [1, 3, 70])
-@pytest.mark.usefixtures("tiles_only")
 def test_tiles_shapes(n: int, batch: int) -> None:  # pragma: no cover
     # The tile pipeline (the default on CUDA) against PAVA on the CPU: lane and chunk edges,
     # partial lanes and chunks, one chunk (finished in one kernel), many merge rounds.
@@ -124,7 +82,6 @@ def test_tiles_shapes(n: int, batch: int) -> None:  # pragma: no cover
 
 @pytest.mark.parametrize("n", [100, 1000, 5000, 100_000])
 @pytest.mark.parametrize("weighted", [False, True])
-@pytest.mark.usefixtures("tiles_only")
 def test_exact_flag(n: int, weighted: bool) -> None:  # pragma: no cover
     # exact=True is the default; exact=False changes float32 only, and on ordinary data stays
     # within float32's tolerance of the CPU.
@@ -166,7 +123,6 @@ def pattern(name: str, n: int, g: torch.Generator) -> torch.Tensor:
 
 @pytest.mark.parametrize("name", PATTERNS)
 @pytest.mark.parametrize("n", [700, 1025, 3000, 5000, 9000, 70_000])
-@pytest.mark.usefixtures("tiles_only")
 def test_tiles_patterns(name: str, n: int) -> None:  # pragma: no cover
     g = torch.Generator().manual_seed(n)
     y = pattern(name, n, g)[None]

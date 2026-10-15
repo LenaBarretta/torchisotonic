@@ -9,17 +9,6 @@ from torch import Tensor
 
 from torchisotonic import _ext
 
-# Few long problems go to the hull algorithm, where a whole GPU block works on each merge;
-# many shorter ones to PAVA with one thread per problem. On the CPU, PAVA always wins.
-HULL_MAX_BATCH = 1024
-HULL_MIN_N = 4096
-HULL_CHUNK = 512
-HULL_ON_CPU = False  # the tests turn this on to check the hull algorithm without a GPU
-# On CUDA: "tiles" (chunk hulls + hull merges, every shape), or the older "pava" / "hull"
-# paths. Problems shorter than TILES_MIN_N would go to PAVA with one thread per problem.
-CUDA_METHOD = "tiles"
-TILES_MIN_N = 1
-
 
 def isotonic(
     y: Tensor,
@@ -96,7 +85,7 @@ class _Isotonic(torch.autograd.Function):
     def backward(ctx: Any, grad: Tensor) -> tuple[Tensor | None, Tensor | None, None, None]:
         flat_y, flat_w, out = ctx.saved_tensors
         want_w = ctx.needs_input_grad[1]
-        if out.is_cuda and CUDA_METHOD == "tiles":  # pragma: no cover - needs a GPU
+        if out.is_cuda:  # pragma: no cover - needs a GPU
             gy, gw = _ext.isotonic_grad(out, grad, flat_w, flat_y if want_w else None)
             return gy if ctx.needs_input_grad[0] else None, gw if want_w else None, None, None
         w = torch.ones_like(out) if flat_w is None else flat_w
@@ -130,33 +119,13 @@ def _block_sums(out: Tensor, *values: Tensor) -> list[Tensor]:
 
 
 def _solve(flat_y: Tensor, flat_w: Tensor | None, increasing: bool, exact: bool = True) -> Tensor:
-    """The fit of [batch, n] problems (n >= 1), in flat_y's dtype."""
-    if (
-        flat_y.is_cuda and CUDA_METHOD == "tiles" and flat_y.shape[1] >= TILES_MIN_N
-    ):  # pragma: no cover - needs a GPU
+    """The fit of [batch, n] problems (n >= 1), in flat_y's dtype: on the GPU by the tile
+    pipeline, on the CPU by pool adjacent violators."""
+    if flat_y.is_cuda:  # pragma: no cover - needs a GPU
         return _ext.isotonic_tiles(
             flat_y.contiguous(), None if flat_w is None else flat_w.contiguous(), increasing, exact
         )
     w = torch.ones_like(flat_y) if flat_w is None else flat_w
     y = flat_y if increasing else -flat_y  # a decreasing fit of y is minus the increasing fit of -y
-    if _use_hull(y):
-        out = _hull(y, w).to(flat_y.dtype)
-    else:
-        out = _ext.isotonic(y.contiguous(), w.contiguous())
+    out = _ext.isotonic(y.contiguous(), w.contiguous())
     return out if increasing else -out
-
-
-def _use_hull(flat: Tensor) -> bool:
-    batch, n = flat.shape
-    return (flat.is_cuda or HULL_ON_CPU) and batch <= HULL_MAX_BATCH and n >= HULL_MIN_N
-
-
-def _hull(flat_y: Tensor, flat_w: Tensor) -> Tensor:
-    """The fit of [batch, n] problems by the hull algorithm (float64 result).
-
-    Isotonic regression commutes with shifting y, so the operator shifts each row by its
-    weighted mean first: that keeps the cumulative sums, and their rounding errors, small.
-    """
-    # Any rough centre does; summing in float64 avoids float64 copies of the whole batch.
-    centre = (flat_w * flat_y).sum(-1, dtype=torch.float64) / flat_w.sum(-1, dtype=torch.float64)
-    return _ext.isotonic_hull(flat_y.contiguous(), flat_w.contiguous(), centre, HULL_CHUNK)

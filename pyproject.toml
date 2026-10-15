@@ -56,10 +56,7 @@ explicit = true
 # The sources, the tests (with docs/hull_prototype.py, which one of them checks), README and
 # licence. notes/ and IDE settings are kept out of git through .git/info/exclude, which hatch
 # does not read, so they are listed here too.
-exclude = [
-    "bench", "notebooks", "kaggle", "experiments", "examples", "cloud", ".github",
-    "notes", ".idea", ".vscode", "uv.lock",
-]
+exclude = ["bench", "examples", ".github", "notes", ".idea", ".vscode", "uv.lock"]
 
 [tool.hatch.version]
 path = "src/torchisotonic/__init__.py"
@@ -70,7 +67,6 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-extend-exclude = ["notebooks"]
 target-version = "py310"
 
 [tool.ruff.lint]

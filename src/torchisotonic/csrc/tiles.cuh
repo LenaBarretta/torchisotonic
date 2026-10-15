@@ -1,7 +1,7 @@
 // The CUDA pipeline behind torchisotonic::isotonic_tiles (registered in ops_tiles.cu). It is a
-// header so that the variants in experiments/ can reuse the parts they do not change.
+// header so that variants of the pipeline can reuse the parts they do not change.
 //
-// The fit is the slope of the lower convex hull of the cumulative sum diagram (hull.h). Every
+// The fit is the slope of the lower convex hull of the cumulative sum diagram. Every
 // element is read once, by one thread; after that only hull vertices travel:
 //
 // 1. chunk_kernel: one block per chunk of up to 4096 neighbouring elements of a problem
@@ -38,7 +38,6 @@
 #include <torch/library.h>
 
 #include <algorithm>
-#include <cstdlib>
 #include <limits>
 #include <type_traits>
 
@@ -51,44 +50,6 @@ constexpr int kLanes = 32;
 constexpr int kThreads = 256;
 constexpr int64_t kThreadMerges = 256;  // rounds with this many merges: a thread per merge
 
-// Built with -DTI_PHASES (bench/phases.py), chunk_kernel adds up its warps' clock cycles per
-// phase: 0 load, 1 lane hulls, 2 lane starts, 3 merging lane hulls, 4 writing.
-#ifdef TI_PHASES
-__device__ unsigned long long phase_cycles[8];
-// Merge statistics: per round, nodes / segment descriptors / vertices alive after it; and
-// over all merges, how many there were and how many walks gave up (kSegWalk) for a search.
-constexpr int kStatRounds = 32;
-__device__ unsigned long long merge_level_stats[kStatRounds][3];
-__device__ unsigned long long merge_counts[2];
-#define TI_MARK(i)                                                          \
-  do {                                                                      \
-    if (lane == 0) {                                                        \
-      const long long now = clock64();                                      \
-      atomicAdd(&phase_cycles[i], static_cast<unsigned long long>(now - mark)); \
-      mark = now;                                                           \
-    }                                                                       \
-  } while (0)
-// ...and with phase_stop = i, returns right after phase i: timing the kernel cut at every
-// phase gives each phase's real share (the write that depends on `keep` never happens, it
-// only stops the compiler from dropping or delaying the work before the cut).
-__device__ int phase_stop = 99;
-#define TI_STOP(i, keep)                      \
-  do {                                        \
-    if (phase_stop == (i)) {                  \
-      if ((keep) == 0x7654321) {              \
-        out[start] = scalar_t(0);             \
-      }                                       \
-      return;                                 \
-    }                                         \
-  } while (0)
-#else
-#define TI_MARK(i) \
-  do {             \
-  } while (0)
-#define TI_STOP(i, keep) \
-  do {                   \
-  } while (0)
-#endif
 
 // Lane l's elements live at l * 33 + k: a warp reading one element per lane hits 32 banks.
 __device__ __forceinline__ int pad(int e) {
@@ -500,25 +461,23 @@ __device__ __forceinline__ acc_t turn2(
 // point: the left end moves left and the right end right until the line between them supports
 // both hulls. Every step but a last one per pass passes over a vertex that the merge removes,
 // and a vertex is removed once, so all the walks of a chunk take O(its size) steps whatever
-// the data. One thread; returns the number of steps (for bench/phases.py).
+// the data. One thread.
 template <typename C, typename Load>
-__device__ int walk_bridge(
+__device__ void walk_bridge(
     const C& c, Load load, int start, int shared, int t1, int end, int* a_out, int* b_out) {
   using acc_t = typename C::acc;
   int a = prev_vertex(c, shared), b = next_vertex(c, shared, t1, end);
   Point2<acc_t> pa = load(a), pb = load(b);
   if (turn2<C::kW, C::kExact>(pa, load(shared), pb) > 0) {
     *a_out = -1;  // convex at the shared point
-    return 0;
+    return;
   }
-  int steps = 0;
   bool moved = true;
   while (moved) {
     moved = false;
     while (b != end) {
       const int nb = next_vertex(c, b, t1, end);
       const Point2<acc_t> q = load(nb);
-      ++steps;
       if (turn2<C::kW, C::kExact>(pa, pb, q) > 0) {
         break;
       }
@@ -529,7 +488,6 @@ __device__ int walk_bridge(
     while (a != start) {
       const int na = prev_vertex(c, a);
       const Point2<acc_t> q = load(na);
-      ++steps;
       if (turn2<C::kW, C::kExact>(q, pa, pb) > 0) {
         break;
       }
@@ -540,7 +498,6 @@ __device__ int walk_bridge(
   }
   *a_out = a;
   *b_out = b;
-  return steps;
 }
 
 // The bits of lane t's points strictly between points a and b.
@@ -710,9 +667,6 @@ __global__ void __launch_bounds__(WARPS * kLanes) chunk_kernel(
   constexpr int kL = C::kL, kN = C::kN;
   __shared__ C c;
   const int t = threadIdx.x, lane = t % kLanes, warp = t / kLanes;  // t: this thread's lane
-#ifdef TI_PHASES
-  long long mark = clock64();
-#endif
   const int64_t g = blockIdx.x, r = g / per_row, j = g % per_row, start = r * n + j * kN;
   const int len = static_cast<int>(n - j * kN < kN ? n - j * kN : kN);
 
@@ -740,24 +694,18 @@ __global__ void __launch_bounds__(WARPS * kLanes) chunk_kernel(
     }
   }
   nan = __syncthreads_or(nan);
-  TI_MARK(0);
-  TI_STOP(0, __float_as_int(static_cast<float>(c.sy[pad(t)])) + int(nan));
 
   // Each lane: the hull of its points 0..count (point count is the next lane's 0).
   const int count = imax(0, imin(kLanes, len - t * kLanes));
   acc_t tx = 0, ty = 0, txl = 0, tyl = 0;
   uint32_t mask = lane_hull(c, t * (kLanes + 1), count, ty, tyl, tx, txl);
 
-  TI_MARK(1);
-  TI_STOP(1, static_cast<int>(mask) ^ __float_as_int(static_cast<float>(ty)));
   const double iy = lane_starts<acc_t, WARPS>(ty, tyl, lane, warp, c.by, c.wy);
   double ix = 0.0;
   if constexpr (W) {
     ix = lane_starts<acc_t, WARPS>(tx, txl, lane, warp, c.bx, c.wx);
   }
 
-  TI_MARK(2);
-  TI_STOP(2, static_cast<int>(mask) ^ __float_as_int(static_cast<float>(c.by[0][t])));
   // Merge the lane hulls: round `level` merges pairs of 2^level lanes. Merge q joins lanes
   // [t0, t0 + half) and [t0 + half, t0 + 2 half); its first lane walks to the bridge, and its
   // lanes clear the mask bits under it. Up to round 4 a merge is within a warp.
@@ -773,11 +721,11 @@ __global__ void __launch_bounds__(WARPS * kLanes) chunk_kernel(
     } else {
       __syncthreads();
     }
-    int a = -1, b = -1, steps = 0;
+    int a = -1, b = -1;
     if (valid && t == t0) {
       const int t1 = imin(t0 + G, active);
-      steps = walk_bridge(c, [&](int p) { return chunk_point(c, p); }, t0 * kLanes, tm * kLanes,
-                          t1, t1 < active ? t1 * kLanes : len, &a, &b);
+      walk_bridge(c, [&](int p) { return chunk_point(c, p); }, t0 * kLanes, tm * kLanes, t1,
+                  t1 < active ? t1 * kLanes : len, &a, &b);
     }
     if (in_warp) {
       a = __shfl_sync(kFull, a, t0 % kLanes);
@@ -793,21 +741,6 @@ __global__ void __launch_bounds__(WARPS * kLanes) chunk_kernel(
         b = c.bridge[1][t0 / G];
       }
     }
-#ifdef TI_PHASES
-    {  // walk steps: in all, and the longest of the round (what the warp waits for)
-      int most = steps, all = steps;
-      for (int d = 16; d > 0; d >>= 1) {
-        most = imax(most, __shfl_xor_sync(kFull, most, d));
-        all += __shfl_xor_sync(kFull, all, d);
-      }
-      if (lane == 0) {
-        atomicAdd(&phase_cycles[5], static_cast<unsigned long long>(all));
-        atomicAdd(&phase_cycles[6], static_cast<unsigned long long>(most));
-      }
-    }
-#else
-    (void)steps;
-#endif
     if (valid && a >= 0) {
       mask &= ~between(a, b, t);
     }
@@ -835,8 +768,6 @@ __global__ void __launch_bounds__(WARPS * kLanes) chunk_kernel(
     c.off[kL] = first + count_v;
   }
   __syncthreads();
-  TI_MARK(3);
-  TI_STOP(3, static_cast<int>(mask) ^ c.off[kL]);
   const int top = c.off[kL];
 
   if (per_row == 1) {  // the chunk is the whole problem: write its fit
@@ -933,7 +864,6 @@ __global__ void __launch_bounds__(WARPS * kLanes) chunk_kernel(
     for (int e = t; e < len; e += kL) {
       out[start + e] = nan ? std::numeric_limits<scalar_t>::quiet_NaN() : c.sy[pad(e)];
     }
-    TI_MARK(4);
     return;
   }
 
@@ -968,7 +898,6 @@ __global__ void __launch_bounds__(WARPS * kLanes) chunk_kernel(
       h.row_nan[r] = 1;
     }
   }
-  TI_MARK(4);
 }
 
 // Problems of up to 512 elements, several per warp: problem q of a warp takes its lanes
@@ -1527,14 +1456,6 @@ __device__ void merge_pair(Hulls h, const Row<W>& row, int64_t first, int64_t ha
       bridge_start<W, WARP>(row, L, nl, R, nr, lane, &sa, &pa);
       tangent(row, R, nr, row.at(L[sa], pa), L, sa, pa, &sb, &pb);
     }
-#ifdef TI_PHASES
-    if (lane == 0) {
-      atomicAdd(&merge_counts[0], 1ull);
-      if (!walked) {
-        atomicAdd(&merge_counts[1], 1ull);
-      }
-    }
-#endif
     keep = sa + 1;
     hi_l = pa;
     from = sb;
@@ -1719,26 +1640,6 @@ int64_t blocks_for_warps(int64_t warps) {
   return (warps * kLanes + kThreads - 1) / kThreads;
 }
 
-#ifdef TI_PHASES
-// After a round: the nodes' descriptor counts and vertices alive, summed into round `r`.
-__global__ void merge_stats_kernel(
-    const Seg* seg, const int32_t* nseg, int64_t batch, int64_t per_row, int64_t span, int r) {
-  const int64_t id = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t nodes = (per_row + span - 1) / span;
-  if (id >= batch * nodes) {
-    return;
-  }
-  const int64_t first = (id / nodes) * per_row + (id % nodes) * span;
-  const int n = nseg[first];
-  unsigned long long vertices = 0;
-  for (int i = 0; i < n; ++i) {
-    vertices += seg[first + i].hi - seg[first + i].lo + 1;
-  }
-  atomicAdd(&merge_level_stats[r][0], 1ull);
-  atomicAdd(&merge_level_stats[r][1], static_cast<unsigned long long>(n));
-  atomicAdd(&merge_level_stats[r][2], vertices);
-}
-#endif
 
 // Chunk starts: per row, the exclusive prefix sums of its chunks' totals as hi + lo pairs,
 // plus the row's total in column per_row. One block per row; a thread sums a slice of
@@ -1808,18 +1709,6 @@ void merge_rounds(
           h, cy, cx, batch, per_row, half);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-#ifdef TI_PHASES
-    {
-      static int round = 0;  // reset by tiles_phases
-      const int64_t nodes = batch * ((per_row + 2 * half - 1) / (2 * half));
-      if (round < kStatRounds) {
-        merge_stats_kernel<<<(nodes + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-            h.seg, h.nseg, batch, per_row, 2 * half, round);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-      }
-      round = half * 2 < per_row ? round + 1 : 0;
-    }
-#endif
   }
 }
 
@@ -1827,7 +1716,7 @@ void merge_rounds(
 // problem, fits) launch(chunks, n, per_row, sign, out, hulls, stream) computes, which
 // merge(hulls, cy, cx, batch, per_row, stream) merges, and from which finish(hulls, cy, cx,
 // batch, n, per_row, sign, out, stream) writes the fit: chunk_kernel, merge_rounds and
-// fit_segments below, or an experiment's (experiments/).
+// fit_segments below, or a variant's.
 template <typename scalar_t, bool W, int chunk, typename Launch, typename Merge, typename Finish>
 void run_chunks(
     const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out, Launch launch,
@@ -1972,19 +1861,16 @@ void run_packed(const at::Tensor& y, const at::Tensor* w, bool increasing, at::T
 
 // The chunk size, tuned on a T4: a problem of up to 4096 elements is one chunk of as few warps
 // as cover it (finished in one kernel, no warp idle); longer ones are split into one-warp
-// chunks, whose hulls cost least to build. TI_CHUNK_WARPS (1, 2 or 4) overrides it.
+// chunks, whose hulls cost least to build.
 template <typename scalar_t, bool W, bool EXACT>
 void run_sized(const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out) {
   constexpr int most = chunk_warps<scalar_t, W, EXACT>();
   const int64_t n = y.size(1);
-  if (n <= 512 && !std::getenv("TI_CHUNK_WARPS")) {  // several problems per warp
+  if (n <= 512) {  // several problems per warp
     run_packed<scalar_t, W, EXACT>(y, w, increasing, out);
     return;
   }
-  int warps = n <= 1024 ? 1 : n <= 2048 ? 2 : n <= 4096 ? 4 : 1;
-  if (const char* forced = std::getenv("TI_CHUNK_WARPS")) {
-    warps = std::atoi(forced);
-  }
+  const int warps = n <= 1024 ? 1 : n <= 2048 ? 2 : n <= 4096 ? 4 : 1;
   if (warps >= 4 && most >= 4) {
     run<scalar_t, W, (most >= 4 ? 4 : 1), EXACT>(y, w, increasing, out);
   } else if (warps >= 2 && most >= 2) {

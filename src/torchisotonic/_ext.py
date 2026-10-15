@@ -14,18 +14,8 @@ CSRC = Path(__file__).parent / "csrc"
 
 
 def isotonic(y: Tensor, w: Tensor) -> Tensor:
-    """The increasing isotonic fit of every row of ``y`` ([batch, n], weights ``w``)."""
+    """The increasing isotonic fit of every row of ``y`` ([batch, n], CPU, weights ``w``)."""
     out: Tensor = _load().isotonic(y, w)
-    return out
-
-
-def isotonic_hull(y: Tensor, w: Tensor, centre: Tensor, chunk: int) -> Tensor:
-    """The increasing fit of every row of ``y`` ([batch, n]) by hulls, in float64.
-
-    ``centre`` ([batch], float64) is subtracted from y before the cumulative sums and added
-    back to the fit.
-    """
-    out: Tensor = _load().isotonic_hull(y, w, centre, chunk)
     return out
 
 
@@ -50,7 +40,7 @@ def _load() -> Any:
     """``torch.ops.torchisotonic``, compiled for this machine (and its GPU, if any) once."""
     sources = [CSRC / "ops.cpp"]
     if torch.cuda.is_available() and cpp_extension.CUDA_HOME is not None:  # pragma: no cover
-        sources += [CSRC / "ops_cuda.cu", CSRC / "ops_tiles.cu"]
+        sources += [CSRC / "ops_tiles.cu"]
     cpp_extension.load(
         name="torchisotonic_ops",
         sources=[str(s) for s in sources],

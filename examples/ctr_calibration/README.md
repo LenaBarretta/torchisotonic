@@ -32,8 +32,7 @@ python examples/ctr_calibration/calibrate.py --data path/to/dac/train.txt --out 
 ```
 
 It needs about 8 GB of memory for the data and as much on the GPU. `--rows` takes only the
-first rows, for a quick try. On Kaggle, `kaggle/push.sh example-ctr` runs it with the dataset
-attached.
+first rows, for a quick try.
 
 This folder is not part of the installed package.
 

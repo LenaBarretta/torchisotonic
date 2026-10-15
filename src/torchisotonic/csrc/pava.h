@@ -1,19 +1,9 @@
-// Pool adjacent violators (PAVA) for one weighted, increasing isotonic regression problem.
-//
-// Shared by the CPU and the CUDA code, so it only uses plain arithmetic. One problem's
-// elements are `stride` apart in memory: the CPU code passes 1 (a row), the CUDA code passes
-// the batch size, so that neighbouring threads, each solving its own problem, read
-// neighbouring addresses.
+// Pool adjacent violators (PAVA) for one weighted, increasing isotonic regression problem,
+// on the CPU. One problem's elements are `stride` apart in memory.
 #pragma once
 
 #include <cmath>
 #include <cstdint>
-
-#if defined(__CUDACC__)
-#define TI_HD __host__ __device__
-#else
-#define TI_HD
-#endif
 
 namespace torchisotonic {
 
@@ -23,7 +13,7 @@ namespace torchisotonic {
 // stack of blocks found so far, with `stride` like the data: their start index, total
 // weight and weighted sum. A NaN anywhere in y makes the whole solution NaN.
 template <typename scalar_t, typename acc_t, typename index_t>
-TI_HD void pava(
+void pava(
     const scalar_t* y,
     const scalar_t* w,
     scalar_t* out,
