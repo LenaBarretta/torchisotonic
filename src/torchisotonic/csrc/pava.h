@@ -9,14 +9,16 @@ namespace torchisotonic {
 
 // Solves min sum_i w_i (x_i - y_i)^2 subject to x_0 <= x_1 <= ... <= x_{n-1}.
 //
-// y, w: the problem; out: the solution (may alias y). The three scratch arrays hold the
-// stack of blocks found so far, with `stride` like the data: their start index, total
-// weight and weighted sum. A NaN anywhere in y makes the whole solution NaN.
+// y, w: the problem; out: the solution (may alias y); starts, if not null: 1 where a block
+// of the solution starts, 0 elsewhere. The three scratch arrays hold the stack of blocks found
+// so far, with `stride` like the data: their start index, total weight and weighted sum. A
+// NaN anywhere in y makes the whole solution NaN.
 template <typename scalar_t, typename acc_t, typename index_t>
 void pava(
     const scalar_t* y,
     const scalar_t* w,
     scalar_t* out,
+    uint8_t* starts,
     int64_t n,
     int64_t stride,
     index_t* start,
@@ -28,6 +30,9 @@ void pava(
     if (yi != yi) {  // NaN: no meaningful fit for this problem
       for (int64_t j = 0; j < n; ++j) {
         out[j * stride] = static_cast<scalar_t>(yi);
+        if (starts) {
+          starts[j * stride] = j == 0;
+        }
       }
       return;
     }
@@ -56,6 +61,9 @@ void pava(
     scalar_t mean = static_cast<scalar_t>(total[k * stride] / weight[k * stride]);
     for (int64_t j = first; j < last; ++j) {
       out[j * stride] = mean;
+      if (starts) {
+        starts[j * stride] = j == first;
+      }
     }
   }
 }

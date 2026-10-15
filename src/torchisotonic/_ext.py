@@ -15,25 +15,28 @@ from torch.utils import cpp_extension
 CSRC = Path(__file__).parent / "csrc"
 
 
-def isotonic(y: Tensor, w: Tensor) -> Tensor:
-    """The increasing isotonic fit of every row of ``y`` ([batch, n], CPU, weights ``w``)."""
-    out: Tensor = _load().isotonic(y, w)
-    return out
+def isotonic(y: Tensor, w: Tensor, with_starts: bool = False) -> tuple[Tensor, Tensor]:
+    """The increasing isotonic fit of every row of ``y`` ([batch, n], CPU, weights ``w``), and
+    if ``with_starts`` a bool tensor marking where its blocks start (else an empty one)."""
+    out, starts = _load().isotonic(y, w, with_starts)
+    return out, starts
 
 
 def isotonic_tiles(
-    y: Tensor, w: Tensor | None, increasing: bool, exact: bool = True
-) -> Tensor:  # pragma: no cover
-    """The fit of every row of ``y`` ([batch, n], CUDA) by the tile pipeline, in y's dtype."""
-    out: Tensor = _load().isotonic_tiles(y, w, increasing, exact)
-    return out
+    y: Tensor, w: Tensor | None, increasing: bool, exact: bool = True, with_starts: bool = False
+) -> tuple[Tensor, Tensor]:  # pragma: no cover
+    """The fit of every row of ``y`` ([batch, n], CUDA) by the tile pipeline, in y's dtype, and
+    if ``with_starts`` a bool tensor marking where its blocks start (else an empty one)."""
+    out, starts = _load().isotonic_tiles(y, w, increasing, exact, with_starts)
+    return out, starts
 
 
 def isotonic_grad(
-    out: Tensor, g: Tensor, w: Tensor | None, y: Tensor | None
+    out: Tensor, starts: Tensor, g: Tensor, w: Tensor | None, y: Tensor | None
 ) -> list[Tensor]:  # pragma: no cover
-    """The gradients of a fit ``out`` (CUDA) with respect to y and, given y, to the weights."""
-    grads: list[Tensor] = _load().isotonic_grad(out, g, w, y)
+    """The gradients of a fit ``out`` (CUDA), whose blocks start where ``starts`` is set, with
+    respect to y and, given y, to the weights."""
+    grads: list[Tensor] = _load().isotonic_grad(out, starts, g, w, y)
     return grads
 
 

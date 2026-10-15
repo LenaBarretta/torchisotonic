@@ -1,8 +1,8 @@
 // The gradient of the fit on CUDA: torchisotonic::isotonic_grad.
 //
-// The fit is constant on blocks - runs of equal fitted values in a row (same_block) - each
-// the weighted mean of y over its block, so with g the gradient with
-// respect to the fit, and G and W the sums of g and w over an element's block:
+// The fit is constant on blocks, each the weighted mean of y over its block; the forward pass
+// marks where each block starts (a vertex of the hull), so with g the gradient with respect to
+// the fit, and G and W the sums of g and w over an element's block:
 //
 //   d/dy_i = w_i G / W,   d/dw_i = (y_i - fit_i) G / W.
 //
@@ -28,17 +28,6 @@ namespace torchisotonic {
 
 namespace {
 
-// Whether neighbouring fitted values a and b belong to one block: whether they are equal.
-// Every element under one hull edge gets the same value, the edge's slope, so a block's
-// values are equal exactly; any tolerance would join distinct neighbouring values, and a
-// chain of them over a whole row. Two neighbouring blocks whose means round to the same
-// value count as one: there the fit is not differentiable, and either side's derivative is
-// as valid.
-template <typename T>
-__device__ __forceinline__ bool same_block(T a, T b) {
-  return a == b;
-}
-
 // Lane l's elements at l * (E + 1) + k: reading one element per lane hits E + 1 banks apart.
 template <int E>
 __device__ __forceinline__ int gpad(int e) {
@@ -48,10 +37,11 @@ __device__ __forceinline__ int gpad(int e) {
 template <typename T, bool W, bool Y, int E>
 struct GradShared {
   static constexpr int kN = kLanes * E + kLanes;
-  T out[kN];
   T g[kN];
   T w[W ? kN : 1];
   T y[Y ? kN : 1];
+  T out[Y ? kN : 1];  // the fit, for the weights' gradient
+  uint8_t start[kN];  // where the blocks start
 };
 
 // Warps per block for a tile type: as many as keep the block's shared memory under 40 KB.
@@ -70,18 +60,14 @@ struct LaneRuns {
   T fg = 0, fw = 0, lg = 0, lw = 0;
   T pg[E], pw[E];  // sums within the block, up to each element
 
-  __device__ void scan(
-      const GradShared<T, W, Y, E>& s, int lane, int len, bool row_start, T before) {
+  __device__ void scan(const GradShared<T, W, Y, E>& s, int lane, int len, bool row_start) {
     const int e0 = lane * E, base = lane * (E + 1);
     count = imax(0, imin(E, len - e0));
-    T prev = lane == 0 ? before : s.out[gpad<E>(e0 - 1)];
     T cg = 0, cw = 0;
 #pragma unroll
     for (int k = 0; k < E; ++k) {
       if (k < count) {
-        const T o = s.out[base + k];
-        const bool start = (row_start && lane == 0 && k == 0) || !same_block(o, prev);
-        prev = o;
+        const bool start = (row_start && lane == 0 && k == 0) || s.start[base + k];
         if (start) {
           if (!starts) {
             fg = cg;
@@ -108,11 +94,14 @@ struct LaneRuns {
 
 template <typename T, bool W, bool Y, int E>
 __device__ void load_tile(
-    GradShared<T, W, Y, E>& s, const T* out, const T* g, const T* w, const T* y, int64_t start,
-    int len, int lane) {
+    GradShared<T, W, Y, E>& s, const T* out, const uint8_t* starts, const T* g, const T* w,
+    const T* y, int64_t start, int len, int lane) {
   for (int e = lane; e < len; e += kLanes) {
-    s.out[gpad<E>(e)] = out[start + e];
+    s.start[gpad<E>(e)] = starts[start + e];
     s.g[gpad<E>(e)] = g[start + e];
+    if (Y) {
+      s.out[gpad<E>(e)] = out[start + e];
+    }
     if (W) {
       s.w[gpad<E>(e)] = w[start + e];
     }
@@ -175,8 +164,9 @@ constexpr int kGradTile = kLanes * kLanes;  // elements per tile of a long row (
 // Step 1, long rows: per tile, F (g, w), L (g, w) and whether a block starts in it.
 template <typename T, bool W, int WARPS>
 __global__ void __launch_bounds__(WARPS * kLanes) grad_ends_kernel(
-    const T* __restrict__ out, const T* __restrict__ g, const T* __restrict__ w, int64_t tiles,
-    int64_t n, int64_t per_row, double4* __restrict__ ends, int32_t* __restrict__ has) {
+    const uint8_t* __restrict__ starts, const T* __restrict__ g, const T* __restrict__ w,
+    int64_t tiles, int64_t n, int64_t per_row, double4* __restrict__ ends,
+    int32_t* __restrict__ has) {
   constexpr int E = kLanes;
   __shared__ GradShared<T, W, false, E> shared[WARPS];
   const int lane = threadIdx.x % kLanes, warp = threadIdx.x / kLanes;
@@ -187,9 +177,9 @@ __global__ void __launch_bounds__(WARPS * kLanes) grad_ends_kernel(
   GradShared<T, W, false, E>& s = shared[warp];
   const int64_t j = t % per_row, start = (t / per_row) * n + j * kGradTile;
   const int len = static_cast<int>(n - j * kGradTile < kGradTile ? n - j * kGradTile : kGradTile);
-  load_tile<T, W, false, E>(s, out, g, w, nullptr, start, len, lane);
+  load_tile<T, W, false, E>(s, nullptr, starts, g, w, nullptr, start, len, lane);
   LaneRuns<T, W, false, E> lr;
-  lr.scan(s, lane, len, j == 0, j > 0 ? out[start - 1] : T(0));
+  lr.scan(s, lane, len, j == 0);
   const uint32_t heads = __ballot_sync(kFull, lr.starts != 0);
   const int first = heads ? __ffs(heads) - 1 : kLanes, last = heads ? 31 - __clz(heads) : -1;
   // Before the first start: whole lanes before the first lane with one, then its F; from the
@@ -209,8 +199,8 @@ __global__ void __launch_bounds__(WARPS * kLanes) grad_ends_kernel(
 // one holding its last.
 template <typename T, bool W, bool Y, int E, bool SINGLE, int WARPS>
 __global__ void __launch_bounds__(WARPS * kLanes) grad_fill_kernel(
-    const T* __restrict__ out, const T* __restrict__ g, const T* __restrict__ w,
-    const T* __restrict__ y, int64_t tiles, int64_t n, int64_t per_row,
+    const T* __restrict__ out, const uint8_t* __restrict__ starts, const T* __restrict__ g,
+    const T* __restrict__ w, const T* __restrict__ y, int64_t tiles, int64_t n, int64_t per_row,
     const double4* __restrict__ edges, T* __restrict__ grad_y, T* __restrict__ grad_w) {
   constexpr int kTile = kLanes * E;
   __shared__ GradShared<T, W, Y, E> shared[WARPS];
@@ -224,9 +214,9 @@ __global__ void __launch_bounds__(WARPS * kLanes) grad_fill_kernel(
   const int64_t start = SINGLE ? t * n : (t / per_row) * n + j * kTile;
   const int len = SINGLE ? static_cast<int>(n)
                          : static_cast<int>(n - j * kTile < kTile ? n - j * kTile : kTile);
-  load_tile<T, W, Y, E>(s, out, g, w, y, start, len, lane);
+  load_tile<T, W, Y, E>(s, out, starts, g, w, y, start, len, lane);
   LaneRuns<T, W, Y, E> lr;
-  lr.scan(s, lane, len, j == 0, j > 0 ? out[start - 1] : T(0));
+  lr.scan(s, lane, len, j == 0);
   // A lane's last block (from its last start) runs on to the next lane with a start, the
   // lanes in between whole: L + (Q[next] - Q[lane]), Q the prefix sums of F over the lanes.
   // Without a start further in the tile, it is the tile's last block.
@@ -302,22 +292,23 @@ __global__ void __launch_bounds__(WARPS * kLanes) grad_fill_kernel(
 // Rows of up to 32 E elements, one tile each.
 template <typename T, bool W, bool Y, int E>
 void run_grad_single(
-    const T* out, const T* g, const T* w, const T* y, int64_t batch, int64_t n, T* grad_y,
-    T* grad_w, cudaStream_t stream) {
+    const T* out, const uint8_t* starts, const T* g, const T* w, const T* y, int64_t batch,
+    int64_t n, T* grad_y, T* grad_w, cudaStream_t stream) {
   constexpr int warps = grad_warps<GradShared<T, W, Y, E>>();
   grad_fill_kernel<T, W, Y, E, true, warps>
       <<<(batch + warps - 1) / warps, warps * kLanes, 0, stream>>>(
-          out, g, w, y, batch, n, 1, nullptr, grad_y, grad_w);
+          out, starts, g, w, y, batch, n, 1, nullptr, grad_y, grad_w);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template <typename T, bool W, bool Y>
 void run_grad(
-    const at::Tensor& out, const at::Tensor& g, const at::Tensor* w, const at::Tensor* y,
-    at::Tensor& grad_y, at::Tensor& grad_w) {
+    const at::Tensor& out, const at::Tensor& starts, const at::Tensor& g, const at::Tensor* w,
+    const at::Tensor* y, at::Tensor& grad_y, at::Tensor& grad_w) {
   const int64_t batch = out.size(0), n = out.size(1);
   const auto stream = at::cuda::getCurrentCUDAStream();
   const T* op = out.data_ptr<T>();
+  const uint8_t* sp = reinterpret_cast<const uint8_t*>(starts.data_ptr<bool>());
   const T* gp = g.data_ptr<T>();
   const T* wp = W ? w->data_ptr<T>() : nullptr;
   const T* yp = Y ? y->data_ptr<T>() : nullptr;
@@ -325,17 +316,17 @@ void run_grad(
   T* gwp = Y ? grad_w.data_ptr<T>() : nullptr;
   if (n <= kGradTile) {  // one tile per row: E elements per lane, the fewest that cover it
     if (n <= 32) {
-      run_grad_single<T, W, Y, 1>(op, gp, wp, yp, batch, n, gyp, gwp, stream);
+      run_grad_single<T, W, Y, 1>(op, sp, gp, wp, yp, batch, n, gyp, gwp, stream);
     } else if (n <= 64) {
-      run_grad_single<T, W, Y, 2>(op, gp, wp, yp, batch, n, gyp, gwp, stream);
+      run_grad_single<T, W, Y, 2>(op, sp, gp, wp, yp, batch, n, gyp, gwp, stream);
     } else if (n <= 128) {
-      run_grad_single<T, W, Y, 4>(op, gp, wp, yp, batch, n, gyp, gwp, stream);
+      run_grad_single<T, W, Y, 4>(op, sp, gp, wp, yp, batch, n, gyp, gwp, stream);
     } else if (n <= 256) {
-      run_grad_single<T, W, Y, 8>(op, gp, wp, yp, batch, n, gyp, gwp, stream);
+      run_grad_single<T, W, Y, 8>(op, sp, gp, wp, yp, batch, n, gyp, gwp, stream);
     } else if (n <= 512) {
-      run_grad_single<T, W, Y, 16>(op, gp, wp, yp, batch, n, gyp, gwp, stream);
+      run_grad_single<T, W, Y, 16>(op, sp, gp, wp, yp, batch, n, gyp, gwp, stream);
     } else {
-      run_grad_single<T, W, Y, 32>(op, gp, wp, yp, batch, n, gyp, gwp, stream);
+      run_grad_single<T, W, Y, 32>(op, sp, gp, wp, yp, batch, n, gyp, gwp, stream);
     }
     return;
   }
@@ -347,7 +338,7 @@ void run_grad(
   {
     constexpr int warps = grad_warps<GradShared<T, W, false, kLanes>>();
     grad_ends_kernel<T, W, warps><<<(tiles + warps - 1) / warps, warps * kLanes, 0, stream>>>(
-        op, gp, wp, tiles, n, per_row, reinterpret_cast<double4*>(ends.data_ptr<double>()),
+        sp, gp, wp, tiles, n, per_row, reinterpret_cast<double4*>(ends.data_ptr<double>()),
         has.data_ptr<int32_t>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
@@ -359,42 +350,46 @@ void run_grad(
   const at::Tensor e4 = ends.view({batch, per_row, 4});
   const at::Tensor f = e4.narrow(2, 0, 2), l = e4.narrow(2, 2, 2);
   const at::Tensor p = at::cumsum(f, 1);
-  const at::Tensor starts = has.view({batch, per_row}).to(at::kBool);
+  const at::Tensor tile_starts = has.view({batch, per_row}).to(at::kBool);
   const at::Tensor index =
       at::arange(per_row, out.options().dtype(at::kLong)).expand({batch, per_row});
-  at::Tensor next = at::where(starts, index, at::full_like(index, per_row));
+  at::Tensor next = at::where(tile_starts, index, at::full_like(index, per_row));
   next = std::get<0>(at::cummin(next.flip(1), 1)).flip(1);  // first start tile >= t
   next = at::cat({next.narrow(1, 1, per_row - 1), at::full_like(next.narrow(1, 0, 1), per_row)}, 1)
              .clamp_max(per_row - 1);  // first start tile > t, or the row's last tile
   const at::Tensor at_next = at::gather(p, 1, next.unsqueeze(2).expand({batch, per_row, 2}));
   const at::Tensor last_block = l + at_next - p;  // for tiles with a start
-  at::Tensor prev = at::where(starts, index, at::full_like(index, -1));
+  at::Tensor prev = at::where(tile_starts, index, at::full_like(index, -1));
   prev = std::get<0>(at::cummax(prev, 1));
   prev = at::cat({at::zeros_like(prev.narrow(1, 0, 1)), prev.narrow(1, 0, per_row - 1)}, 1)
              .clamp_min(0);  // latest start tile < t
   const at::Tensor first_block =
       at::gather(last_block, 1, prev.unsqueeze(2).expand({batch, per_row, 2}));
   // For a tile without a start, its last block is its first.
-  const at::Tensor last_or_first = at::where(starts.unsqueeze(2), last_block, first_block);
+  const at::Tensor last_or_first = at::where(tile_starts.unsqueeze(2), last_block, first_block);
   const at::Tensor edges = at::cat({first_block, last_or_first}, 2).contiguous();
 
   {
     constexpr int warps = grad_warps<GradShared<T, W, Y, kLanes>>();
     grad_fill_kernel<T, W, Y, kLanes, false, warps>
         <<<(tiles + warps - 1) / warps, warps * kLanes, 0, stream>>>(
-            op, gp, wp, yp, tiles, n, per_row,
+            op, sp, gp, wp, yp, tiles, n, per_row,
             reinterpret_cast<const double4*>(edges.data_ptr<double>()), gyp, gwp);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 }
 
-// out: the fit ([batch, n]); g: the gradient with respect to it; w: the weights, if any; y: the
-// data, if the gradient with respect to the weights is wanted (with w). Returns the gradient
-// with respect to y, and the one with respect to w (empty without y).
+// out: the fit ([batch, n]); starts: where its blocks start (bool, from isotonic_tiles); g: the
+// gradient with respect to the fit; w: the weights, if any; y: the data, if the gradient with
+// respect to the weights is wanted (with w). Returns the gradient with respect to y, and the
+// one with respect to w (empty without y).
 std::vector<at::Tensor> isotonic_grad_cuda(
-    const at::Tensor& out, const at::Tensor& g, const c10::optional<at::Tensor>& w,
-    const c10::optional<at::Tensor>& y) {
+    const at::Tensor& out, const at::Tensor& starts, const at::Tensor& g,
+    const c10::optional<at::Tensor>& w, const c10::optional<at::Tensor>& y) {
   TORCH_CHECK(out.dim() == 2 && out.is_contiguous(), "out must be a contiguous [batch, n]");
+  TORCH_CHECK(starts.sizes() == out.sizes() && starts.scalar_type() == at::kBool &&
+                  starts.is_contiguous(),
+              "starts must be a contiguous bool tensor shaped like out");
   TORCH_CHECK(g.sizes() == out.sizes() && g.scalar_type() == out.scalar_type(), "bad g");
   TORCH_CHECK(!y.has_value() || w.has_value(), "y is only needed for the weights' gradient");
   const c10::cuda::CUDAGuard guard(out.device());
@@ -406,11 +401,11 @@ std::vector<at::Tensor> isotonic_grad_cuda(
   if (out.numel() > 0) {
     AT_DISPATCH_FLOATING_TYPES(out.scalar_type(), "isotonic_grad_cuda", [&] {
       if (y.has_value()) {
-        run_grad<scalar_t, true, true>(out, gc, &wc, &yc, grad_y, grad_w);
+        run_grad<scalar_t, true, true>(out, starts, gc, &wc, &yc, grad_y, grad_w);
       } else if (w.has_value()) {
-        run_grad<scalar_t, true, false>(out, gc, &wc, nullptr, grad_y, grad_w);
+        run_grad<scalar_t, true, false>(out, starts, gc, &wc, nullptr, grad_y, grad_w);
       } else {
-        run_grad<scalar_t, false, false>(out, gc, nullptr, nullptr, grad_y, grad_w);
+        run_grad<scalar_t, false, false>(out, starts, gc, nullptr, nullptr, grad_y, grad_w);
       }
     });
   }

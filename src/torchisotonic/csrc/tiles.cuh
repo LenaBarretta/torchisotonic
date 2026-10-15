@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <limits>
 #include <type_traits>
+#include <vector>
 
 namespace torchisotonic {
 
@@ -651,6 +652,9 @@ struct Hulls {  // the chunks' hulls (vertices in their chunk's coordinates) and
   // a difference of two of them loses six digits.
   const double* cy_lo;
   const double* cx_lo;
+  // Where the fit's blocks start: 1 at element k if point k is a vertex of the row's hull
+  // (the gradient's blocks). Written only if not null.
+  uint8_t* starts;
 };
 
 template <typename scalar_t, bool W, int WARPS, bool EXACT = true>
@@ -863,6 +867,9 @@ __global__ void __launch_bounds__(WARPS * kLanes) chunk_kernel(
     __syncthreads();
     for (int e = t; e < len; e += kL) {
       out[start + e] = nan ? std::numeric_limits<scalar_t>::quiet_NaN() : c.sy[pad(e)];
+      if (h.starts) {
+        h.starts[start + e] = (c.mask[e / kLanes] >> (e % kLanes)) & 1u;
+      }
     }
     return;
   }
@@ -914,7 +921,8 @@ __global__ void __launch_bounds__(WARPS * kLanes) packed_kernel(
     int L,
     unsigned long long inv_n,  // ceil(2^32 / n): e / n = (e * inv_n) >> 32 for these e
     scalar_t sign,
-    scalar_t* __restrict__ out) {
+    scalar_t* __restrict__ out,
+    uint8_t* __restrict__ block_starts) {
   using acc_t = scalar_t;
   using C = Chunk<acc_t, W, 1, EXACT>;
   __shared__ C shared[WARPS];
@@ -1091,6 +1099,9 @@ __global__ void __launch_bounds__(WARPS * kLanes) packed_kernel(
     const int pos = at(e);
     out[start + e] =
         bad[warp][pos / span] ? std::numeric_limits<scalar_t>::quiet_NaN() : c.sy[pad(pos)];
+    if (block_starts) {
+      block_starts[start + e] = (c.mask[pos / kLanes] >> (pos % kLanes)) & 1u;
+    }
   }
 }
 
@@ -1518,8 +1529,8 @@ __global__ void merge_kernel(
 // its first one and out of its last one (for a chunk without vertices, of the edge over it).
 template <bool W>
 __global__ void ends_kernel(
-    Hulls h, const double* cy, const double* cx, int64_t chunks, int64_t per_row,
-    int2* __restrict__ range, double2* __restrict__ ends) {
+    Hulls h, const double* cy, const double* cx, int64_t chunks, int64_t per_row, int chunk,
+    int2* __restrict__ range, double2* __restrict__ ends, int32_t* __restrict__ head) {
   const int64_t g = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (g >= chunks) {
     return;
@@ -1551,6 +1562,10 @@ __global__ void ends_kernel(
     range[g] = make_int2(1, 0);
     ends[g] = make_double2(v, v);
   }
+  // Whether a block starts at the chunk's first element: the point it shares with the chunk
+  // before is a vertex, kept as the last vertex of the segment before this chunk's own.
+  const int before = s.chunk == j ? lo - 1 : lo;
+  head[g] = before >= 0 && h.p[L[before].voff + L[before].hi] == static_cast<int64_t>(j) * chunk;
 }
 
 constexpr int kFitSpan = 1024;  // elements per block of fit_kernel
@@ -1559,8 +1574,9 @@ constexpr int kFitSpan = 1024;  // elements per block of fit_kernel
 // them, then every element's.
 template <typename scalar_t, bool W>
 __global__ void __launch_bounds__(kThreads) fit_kernel(
-    Hulls h, const int2* __restrict__ range, const double2* __restrict__ ends, int64_t n,
-    int64_t per_row, int chunk, scalar_t sign, scalar_t* __restrict__ out) {
+    Hulls h, const int2* __restrict__ range, const double2* __restrict__ ends,
+    const int32_t* __restrict__ head, int64_t n, int64_t per_row, int chunk, scalar_t sign,
+    scalar_t* __restrict__ out) {
   using acc_t = scalar_t;
   __shared__ int32_t at[kFitSpan + 2];
   __shared__ acc_t slope[kFitSpan + 2];
@@ -1633,6 +1649,9 @@ __global__ void __launch_bounds__(kThreads) fit_kernel(
       }
     }
     out[start + e] = sign * (a ? slope[a - 1] : in);
+    if (h.starts) {
+      h.starts[start + e] = (a > 0 && at[a - 1] == p) || (p == j * chunk && head[g]);
+    }
   }
 }
 
@@ -1719,8 +1738,8 @@ void merge_rounds(
 // fit_segments below, or a variant's.
 template <typename scalar_t, bool W, int chunk, typename Launch, typename Merge, typename Finish>
 void run_chunks(
-    const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out, Launch launch,
-    Merge merge, Finish finish) {
+    const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out,
+    uint8_t* block_starts, Launch launch, Merge merge, Finish finish) {
   constexpr int64_t slots = chunk + 1;  // vertices of a chunk's hull, at most
   const int64_t batch = y.size(0), n = y.size(1);
   const int64_t per_row = (n + chunk - 1) / chunk, chunks = batch * per_row;
@@ -1748,6 +1767,7 @@ void run_chunks(
               ty.data_ptr<double>(), W ? tx.data_ptr<double>() : nullptr,
               row_nan.data_ptr<int32_t>()};
   }
+  h.starts = block_starts;
 
   launch(chunks, n, per_row, sign, out.data_ptr<scalar_t>(), h, stream);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1790,36 +1810,40 @@ void fit_segments(
   const auto opts = at::TensorOptions().device(at::kCUDA, at::cuda::current_device());
   at::Tensor range = at::empty({chunks * 2}, opts.dtype(at::kInt));
   at::Tensor ends = at::empty({chunks * 2}, opts.dtype(at::kDouble));
+  at::Tensor head = at::empty({chunks}, opts.dtype(at::kInt));
   auto* rp = reinterpret_cast<int2*>(range.data_ptr<int32_t>());
   auto* ep = reinterpret_cast<double2*>(ends.data_ptr<double>());
+  int32_t* hp = head.data_ptr<int32_t>();
   ends_kernel<W><<<(chunks + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-      h, cy, cx, chunks, per_row, rp, ep);
+      h, cy, cx, chunks, per_row, chunk, rp, ep, hp);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   fit_kernel<scalar_t, W><<<chunks * (chunk / kFitSpan), kThreads, 0, stream>>>(
-      h, rp, ep, n, per_row, chunk, sign, out);
+      h, rp, ep, hp, n, per_row, chunk, sign, out);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template <typename scalar_t, bool W, int chunk, typename Launch, typename Merge>
 void run_chunks(
-    const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out, Launch launch,
-    Merge merge) {
+    const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out,
+    uint8_t* block_starts, Launch launch, Merge merge) {
   run_chunks<scalar_t, W, chunk>(
-      y, w, increasing, out, launch, merge, fit_segments<scalar_t, W, chunk>);
+      y, w, increasing, out, block_starts, launch, merge, fit_segments<scalar_t, W, chunk>);
 }
 
 template <typename scalar_t, bool W, int chunk, typename Launch>
 void run_chunks(
-    const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out, Launch launch) {
-  run_chunks<scalar_t, W, chunk>(y, w, increasing, out, launch, merge_rounds<W>);
+    const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out,
+    uint8_t* block_starts, Launch launch) {
+  run_chunks<scalar_t, W, chunk>(y, w, increasing, out, block_starts, launch, merge_rounds<W>);
 }
 
 template <typename scalar_t, bool W, int warps, bool EXACT>
-void run(const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out) {
+void run(const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out,
+         uint8_t* block_starts) {
   const scalar_t* yp = y.data_ptr<scalar_t>();
   const scalar_t* wp = W ? w->data_ptr<scalar_t>() : nullptr;
   run_chunks<scalar_t, W, Chunk<scalar_t, W, warps, EXACT>::kN>(
-      y, w, increasing, out,
+      y, w, increasing, out, block_starts,
       [&](int64_t chunks, int64_t n, int64_t per_row, scalar_t sign, scalar_t* o, Hulls h,
           cudaStream_t stream) {
         // The largest shared memory carveout: shared memory limits the blocks per SM.
@@ -1837,7 +1861,8 @@ void run(const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& 
 
 // Problems of up to 512 elements, several per warp (packed_kernel).
 template <typename scalar_t, bool W, bool EXACT>
-void run_packed(const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out) {
+void run_packed(const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out,
+                uint8_t* block_starts) {
   // Warps per block, each on its own problems: up to 4, as shared memory allows.
   constexpr int per_warp_shared = static_cast<int>(sizeof(Chunk<scalar_t, W, 1, EXACT>)) +
                                   kLanes * static_cast<int>(sizeof(int));
@@ -1855,7 +1880,7 @@ void run_packed(const at::Tensor& y, const at::Tensor* w, bool increasing, at::T
   packed_kernel<scalar_t, W, warps, EXACT>
       <<<(groups + warps - 1) / warps, warps * kLanes, 0, at::cuda::getCurrentCUDAStream()>>>(
           y.data_ptr<scalar_t>(), W ? w->data_ptr<scalar_t>() : nullptr, batch, n, L, inv_n,
-          increasing ? scalar_t(1) : scalar_t(-1), out.data_ptr<scalar_t>());
+          increasing ? scalar_t(1) : scalar_t(-1), out.data_ptr<scalar_t>(), block_starts);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -1863,26 +1888,30 @@ void run_packed(const at::Tensor& y, const at::Tensor* w, bool increasing, at::T
 // as cover it (finished in one kernel, no warp idle); longer ones are split into one-warp
 // chunks, whose hulls cost least to build.
 template <typename scalar_t, bool W, bool EXACT>
-void run_sized(const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out) {
+void run_sized(const at::Tensor& y, const at::Tensor* w, bool increasing, at::Tensor& out,
+               uint8_t* block_starts) {
   constexpr int most = chunk_warps<scalar_t, W, EXACT>();
   const int64_t n = y.size(1);
   if (n <= 512) {  // several problems per warp
-    run_packed<scalar_t, W, EXACT>(y, w, increasing, out);
+    run_packed<scalar_t, W, EXACT>(y, w, increasing, out, block_starts);
     return;
   }
   const int warps = n <= 1024 ? 1 : n <= 2048 ? 2 : n <= 4096 ? 4 : 1;
   if (warps >= 4 && most >= 4) {
-    run<scalar_t, W, (most >= 4 ? 4 : 1), EXACT>(y, w, increasing, out);
+    run<scalar_t, W, (most >= 4 ? 4 : 1), EXACT>(y, w, increasing, out, block_starts);
   } else if (warps >= 2 && most >= 2) {
-    run<scalar_t, W, (most >= 2 ? 2 : 1), EXACT>(y, w, increasing, out);
+    run<scalar_t, W, (most >= 2 ? 2 : 1), EXACT>(y, w, increasing, out, block_starts);
   } else {
-    run<scalar_t, W, 1, EXACT>(y, w, increasing, out);
+    run<scalar_t, W, 1, EXACT>(y, w, increasing, out, block_starts);
   }
 }
 
 // exact = false: float32 without the pairs within lanes (see Chunk); float64 is unaffected.
-at::Tensor isotonic_tiles_cuda(
-    const at::Tensor& y, const c10::optional<at::Tensor>& w, bool increasing, bool exact = true) {
+// Returns the fit and, if with_starts, a bool [batch, n] marking where its blocks start (else
+// an empty tensor).
+std::vector<at::Tensor> isotonic_tiles_cuda(
+    const at::Tensor& y, const c10::optional<at::Tensor>& w, bool increasing, bool exact,
+    bool with_starts) {
   TORCH_CHECK(y.dim() == 2 && y.size(1) >= 1, "y must be [batch, n] with n >= 1");
   TORCH_CHECK(y.is_contiguous(), "y must be contiguous");
   const bool weighted = w.has_value();
@@ -1894,25 +1923,28 @@ at::Tensor isotonic_tiles_cuda(
               "problems must have fewer than 2^31 - 1 elements");
   const c10::cuda::CUDAGuard guard(y.device());
   at::Tensor out = at::empty_like(y);
+  at::Tensor starts = with_starts ? at::empty(y.sizes(), y.options().dtype(at::kBool))
+                                  : at::empty({0}, y.options().dtype(at::kBool));
+  uint8_t* sp = with_starts ? reinterpret_cast<uint8_t*>(starts.data_ptr<bool>()) : nullptr;
   AT_DISPATCH_FLOATING_TYPES(y.scalar_type(), "isotonic_tiles_cuda", [&] {
     // Only float32 has a separate fast path, so only it is compiled twice.
     if constexpr (sizeof(scalar_t) == 4) {
       if (!exact) {
         if (weighted) {
-          run_sized<scalar_t, true, false>(y, &*w, increasing, out);
+          run_sized<scalar_t, true, false>(y, &*w, increasing, out, sp);
         } else {
-          run_sized<scalar_t, false, false>(y, nullptr, increasing, out);
+          run_sized<scalar_t, false, false>(y, nullptr, increasing, out, sp);
         }
         return;
       }
     }
     if (weighted) {
-      run_sized<scalar_t, true, true>(y, &*w, increasing, out);
+      run_sized<scalar_t, true, true>(y, &*w, increasing, out, sp);
     } else {
-      run_sized<scalar_t, false, true>(y, nullptr, increasing, out);
+      run_sized<scalar_t, false, true>(y, nullptr, increasing, out, sp);
     }
   });
-  return out;
+  return {out, starts};
 }
 
 }  // namespace

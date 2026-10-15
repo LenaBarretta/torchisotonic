@@ -77,55 +77,58 @@ class _Isotonic(torch.autograd.Function):
     def forward(
         ctx: Any, flat_y: Tensor, flat_w: Tensor | None, increasing: bool, exact: bool
     ) -> Tensor:
-        out = _solve(flat_y, flat_w, increasing, exact)
-        ctx.save_for_backward(flat_y, flat_w, out)
+        # Where the fit's blocks start, from the solver itself, for the gradient only.
+        out, starts = _solve(flat_y, flat_w, increasing, exact, any(ctx.needs_input_grad[:2]))
+        ctx.save_for_backward(flat_y, flat_w, out, starts)
         return out
 
     @staticmethod
     def backward(ctx: Any, grad: Tensor) -> tuple[Tensor | None, Tensor | None, None, None]:
-        flat_y, flat_w, out = ctx.saved_tensors
+        flat_y, flat_w, out, starts = ctx.saved_tensors
         want_w = ctx.needs_input_grad[1]
         if out.is_cuda:  # pragma: no cover - needs a GPU
-            gy, gw = _ext.isotonic_grad(out, grad, flat_w, flat_y if want_w else None)
+            gy, gw = _ext.isotonic_grad(out, starts, grad, flat_w, flat_y if want_w else None)
             return gy if ctx.needs_input_grad[0] else None, gw if want_w else None, None, None
         w = torch.ones_like(out) if flat_w is None else flat_w
-        g_sum, w_sum = _block_sums(out, grad, w)
+        g_sum, w_sum = _block_sums(starts, grad, w)
         mean_grad = g_sum / w_sum  # d(loss) / d(block's mean), per unit of weight
         grad_y = w * mean_grad if ctx.needs_input_grad[0] else None
         grad_w = (flat_y - out) * mean_grad if want_w else None
         return grad_y, grad_w, None, None
 
 
-def _block_sums(out: Tensor, *values: Tensor) -> list[Tensor]:
-    """For every element, the sums of each of ``values`` over its block of the fit ``out``.
-
-    A block is a run of equal fitted values in a row, as in grad.cuh's same_block: every
-    solver writes one value per block (or per hull edge), so a block's values are equal
-    exactly. Two neighbouring blocks whose means round to the same value count as one; the fit
-    is not differentiable there, and either side's derivative is as valid.
+def _block_sums(starts: Tensor, *values: Tensor) -> list[Tensor]:
+    """For every element, the sums of each of ``values`` over its block, the blocks of a
+    [batch, n] fit starting where the bool tensor ``starts`` is set (and at every row's start).
 
     No host synchronisation: the blocks are numbered by a prefix sum over all rows, and
     summed into a buffer as long as the whole batch.
     """
-    starts = torch.ones_like(out, dtype=torch.bool)
-    starts[:, 1:] = out[:, 1:] != out[:, :-1]
-    ids = starts.reshape(-1).cumsum(0) - 1
+    heads = starts.clone()
+    heads[:, 0] = True
+    ids = heads.reshape(-1).cumsum(0) - 1
     sums = []
     for v in values:
-        total = torch.zeros(out.numel(), dtype=v.dtype, device=v.device)
+        total = torch.zeros(starts.numel(), dtype=v.dtype, device=v.device)
         total.index_add_(0, ids, v.reshape(-1))
-        sums.append(total[ids].reshape(out.shape))
+        sums.append(total[ids].reshape(starts.shape))
     return sums
 
 
-def _solve(flat_y: Tensor, flat_w: Tensor | None, increasing: bool, exact: bool = True) -> Tensor:
-    """The fit of [batch, n] problems (n >= 1), in flat_y's dtype: on the GPU by the tile
-    pipeline, on the CPU by pool adjacent violators."""
+def _solve(
+    flat_y: Tensor,
+    flat_w: Tensor | None,
+    increasing: bool,
+    exact: bool = True,
+    with_starts: bool = False,
+) -> tuple[Tensor, Tensor]:
+    """The fit of [batch, n] problems (n >= 1), in flat_y's dtype - on the GPU by the tile
+    pipeline, on the CPU by pool adjacent violators - and, if ``with_starts``, where its blocks
+    start (a bool tensor; else an empty one)."""
     if flat_y.is_cuda:  # pragma: no cover - needs a GPU
-        return _ext.isotonic_tiles(
-            flat_y.contiguous(), None if flat_w is None else flat_w.contiguous(), increasing, exact
-        )
+        w = None if flat_w is None else flat_w.contiguous()
+        return _ext.isotonic_tiles(flat_y.contiguous(), w, increasing, exact, with_starts)
     w = torch.ones_like(flat_y) if flat_w is None else flat_w
     y = flat_y if increasing else -flat_y  # a decreasing fit of y is minus the increasing fit of -y
-    out = _ext.isotonic(y.contiguous(), w.contiguous())
-    return out if increasing else -out
+    out, starts = _ext.isotonic(y.contiguous(), w.contiguous(), with_starts)
+    return (out if increasing else -out), starts

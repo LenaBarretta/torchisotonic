@@ -10,6 +10,7 @@ import torch
 from test_grad import close_values
 
 import torchisotonic
+from torchisotonic import _api, _ext
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -160,6 +161,34 @@ def test_gradients_match_cpu(batch: int, n: int) -> None:  # pragma: no cover
 @pytest.mark.parametrize("n", [1024, 1025, 3000, 70_000])
 def test_gradient_blocks_across_tiles(name: str, n: int) -> None:  # pragma: no cover
     # The CUDA gradient sums blocks over tiles of 1024: blocks within, across and over them.
+    # It must be the block average over the blocks the GPU's fit reports, whatever the data.
+    g = torch.Generator().manual_seed(n)
+    y = pattern(name, n, g).expand(3, n).contiguous()
+    w = torch.rand(3, n, generator=g, dtype=torch.float64) + 0.1
+    c = torch.randn(3, n, generator=g, dtype=torch.float64)
+    for weights in (w, None):
+        yy = y.cuda().requires_grad_()
+        ww = None if weights is None else weights.cuda().requires_grad_()
+        fit = torchisotonic.isotonic(yy, ww)
+        inputs = (yy,) if ww is None else (yy, ww)
+        got = torch.autograd.grad((fit * c.cuda()).sum(), inputs)
+        raw_w = None if ww is None else ww.detach()
+        _, starts = _ext.isotonic_tiles(y.cuda(), raw_w, True, True, True)
+        ones = torch.ones_like(y) if weights is None else weights
+        g_sum, w_sum = _api._block_sums(starts.cpu(), c, ones)
+        mean = g_sum / w_sum
+        torch.testing.assert_close(got[0].cpu(), ones * mean, rtol=1e-9, atol=1e-9)
+        if ww is not None:
+            want = (y - fit.detach().cpu()) * mean
+            torch.testing.assert_close(got[1].cpu(), want, rtol=1e-9, atol=1e-9)
+
+
+@pytest.mark.parametrize("name", [p for p in PATTERNS if p not in ("constant", "saw")])
+@pytest.mark.parametrize("n", [1024, 1025, 3000, 70_000])
+def test_gradients_match_cpu_patterns(name: str, n: int) -> None:  # pragma: no cover
+    # Against the CPU, on data whose neighbouring blocks have clearly different means. Ties
+    # and near-ties (the constant and sawtooth patterns) are left out: there the fit is not
+    # differentiable, or nearly not, and each solver's blocks are its own rounding of them.
     g = torch.Generator().manual_seed(n)
     y = pattern(name, n, g).expand(3, n).contiguous()
     w = torch.rand(3, n, generator=g, dtype=torch.float64) + 0.1
@@ -173,13 +202,6 @@ def test_gradient_blocks_across_tiles(name: str, n: int) -> None:  # pragma: no 
         grads.append((gy.cpu(), gw.cpu()))
         (gy,) = torch.autograd.grad((torchisotonic.isotonic(yy) * c.to(device)).sum(), (yy,))
         grads.append((gy.cpu(),))
-    if name == "constant":
-        # Every neighbour ties, so the fit is differentiable nowhere and the blocks are
-        # whatever the rounding of each device makes them. Any blocks pass the gradient's sum
-        # over a row on unchanged, as each spreads its share by weight.
-        for got in grads:
-            torch.testing.assert_close(got[0].sum(1), c.sum(1), rtol=1e-9, atol=1e-9)
-        return
     torch.testing.assert_close(grads[2][0], grads[0][0], rtol=1e-9, atol=1e-9)
     torch.testing.assert_close(grads[3][0], grads[1][0], rtol=1e-9, atol=1e-9)
     # d/dw = (y - fit) G / W: where the fit is y (one-element blocks), the CPU's is y exactly
@@ -216,3 +238,32 @@ def test_float32_fit_is_monotone(name: str, n: int) -> None:  # pragma: no cover
     for w in (None, u + 0.1, torch.exp(8 * u)):
         fit = torchisotonic.isotonic(y.cuda(), None if w is None else w.cuda())
         assert bool((fit[1:] >= fit[:-1]).all())
+
+
+@pytest.mark.parametrize("n", [500, 3000, 100_000])  # packed, one chunk, merged chunks
+def test_gradient_blocks_from_the_hull(n: int) -> None:  # pragma: no cover
+    # Blocks (1 + u, 1, ..., 1) of s elements, u the float32 spacing at 1, s falling from S
+    # to 3: their means 1 + u / s increase, so they are separate blocks, and all round to 1;
+    # the rest of the row is 2, 3, ..., a block per element. The gradient takes its blocks
+    # from the hull, not from equal fitted values.
+    sizes: list[int] = []
+    while sum(sizes) + len(sizes) + 3 <= n:
+        sizes.append(len(sizes) + 3)
+    sizes.reverse()
+    u = torch.finfo(torch.float32).eps
+    y = torch.ones(n)
+    starts = torch.ones(n, dtype=torch.bool)
+    at = 0
+    for size in sizes:
+        y[at] = 1 + u
+        starts[at + 1 : at + size] = False
+        at += size
+    y[at:] = torch.arange(2, 2 + n - at)
+    y, starts = y[None], starts[None]
+    c = torch.randn(1, n, generator=torch.Generator().manual_seed(n))
+    yy = y.cuda().requires_grad_()
+    fit = torchisotonic.isotonic(yy)
+    assert bool((fit[:, :at] == 1).all())  # the case this test is about
+    (grad,) = torch.autograd.grad((fit * c.cuda()).sum(), (yy,))
+    g_sum, count = _api._block_sums(starts, c, torch.ones_like(c))
+    torch.testing.assert_close(grad.cpu(), g_sum / count, rtol=1e-5, atol=1e-6)
