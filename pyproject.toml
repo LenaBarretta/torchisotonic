@@ -62,7 +62,8 @@ explicit = true
 # licence. notes/ and IDE settings are kept out of git through .git/info/exclude, which hatch
 # does not read, so they are listed here too.
 exclude = [
-    "bench", "examples", ".github", "docs/logo.png", "notes", ".idea", ".vscode", "uv.lock",
+    "bench", "examples", "paper", ".github", "docs/logo.png", "notes", ".idea", ".vscode",
+    "uv.lock",
 ]
 
 [tool.hatch.version]
